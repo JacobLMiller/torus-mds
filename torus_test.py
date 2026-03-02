@@ -152,7 +152,8 @@ def MDS_test():
 
     G,D = get_periodic_lattice(20,20)
 
-    D /= np.max(D)
+    # D /= np.max(D)
+    print(np.max(D))
 
     X_torus = MDSTorusProjector().fit_transform(D)
     X_euc   = MDS(dissimilarity="precomputed").fit_transform(D)
@@ -309,39 +310,41 @@ if __name__ == "__main__":
     from sklearn.manifold import MDS
     from umap import UMAP
 
+
     # MDS_test()
-    data = np.load("grid_cells_4800.npz")['data']
-    # data = a['data']
-    # spikes = a['spikes']
-    print(data.shape)
-    # from sklearn.decomposition import PCA
+    # data = np.load("grid_cells_4800.npz")['data']
+    # # data = a['data']
+    # # spikes = a['spikes']
+    # print(data.shape)
+    # # from sklearn.decomposition import PCA
 
-    # pca = PCA(n_components=10).fit_transform(data)
+    # # pca = PCA(n_components=10).fit_transform(data)
 
-    D = pairwise_distances(data)
+    # D = pairwise_distances(data)
 
-    # from sklearn.decomposition import PCA
-    # pca = PCA(2).fit_transform(data)
+    # # from sklearn.decomposition import PCA
+    # # pca = PCA(2).fit_transform(data)
 
-    # c1 = pca[:, 0]
-    # c2 = pca[:, 1]
+    # # c1 = pca[:, 0]
+    # # c2 = pca[:, 1]
 
-    # def norm01(v):
-    #     return (v - v.min()) / (v.max() - v.min())
+    # # def norm01(v):
+    # #     return (v - v.min()) / (v.max() - v.min())
 
-    # r = norm01(c1)          
-    # b = norm01(c2)          
-    # g = np.zeros_like(r) + 0.2
+    # # r = norm01(c1)          
+    # # b = norm01(c2)          
+    # # g = np.zeros_like(r) + 0.2
 
-    # colors = np.stack([r, g, b], axis=1)  
+    # # colors = np.stack([r, g, b], axis=1)  
 
-    # X_torus = UMAPTorusProjector().fit_transform(D)
+    # # X_torus = UMAPTorusProjector().fit_transform(D)
 
-    # np.save("yoda_umap.npy",X_torus)
-    X_torus = MDSTorusProjector().fit_transform(D)
-    np.save("rat_mds.npy",X_torus)
+    # # np.save("yoda_umap.npy",X_torus)
+    # X_torus = MDSTorusProjector().fit_transform(D)
+    # np.save("rat_mds.npy",X_torus)
 
 
 
     #Toroidal random graphs 
-    # 
+    #Chen's block graph datasets
+    #Find some real-world small-world

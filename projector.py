@@ -143,16 +143,125 @@ class TorusProjector:
 
 # -------------------- Subclasses --------------------
 
-@numba.njit(fastmath=True)
-def stress_and_grad(p1,p2,d):
-    delta = ((p2 - p1 + 0.5) % 1.0) - 0.5
-    norm = np.sqrt(np.sum(np.square(delta)))
+import numpy as np
+import numba
 
-    if norm == 0.0: grad = np.zeros_like(p1)
-    else: 
-        grad = 2 * (norm - d) * (-delta / norm)
-    
-    return (norm - d)**2, grad
+
+@numba.njit(fastmath=True, cache=True)
+def stress_and_grad_unit_torus(p1, p2, d, alpha, eps=1e-12):
+    """
+    Consistent model:
+      u in [0,1)^2
+      du = min-image on unit torus
+      delta = alpha * du
+      norm = ||delta|| = alpha * r, where r = ||du||
+
+    Loss: (norm - d)^2
+    Gradient returned is dLoss/dp1 (and you apply antisymmetrically to p2).
+    """
+    du = p2 - p1
+    du0 = (du[0] + 0.5) - np.floor(du[0] + 0.5) - 0.5  # wrap to [-0.5, 0.5)
+    du1 = (du[1] + 0.5) - np.floor(du[1] + 0.5) - 0.5
+
+    r2 = du0 * du0 + du1 * du1
+    r = np.sqrt(r2) + eps
+
+    norm = alpha * r
+    diff = norm - d
+
+    # dLoss/dp1 = 2*diff * d(norm)/dp1
+    # norm = alpha * r, r = ||du||, du = p2 - p1 => dr/dp1 = -(du/r)
+    # => d(norm)/dp1 = alpha * (-(du/r))
+    scale = -2.0 * diff * alpha / r
+
+    g0 = scale * du0
+    g1 = scale * du1
+
+    return diff * diff, np.array((g0, g1), dtype=p1.dtype), r
+
+
+@numba.njit(cache=True, fastmath=True)
+def sgd_minibatch_njit(
+    data,
+    learning_rate,
+    max_iters=500,
+    batch_pairs=4096,
+    seed=0,
+    alpha_init=1.0,
+    alpha_ema=0.05,   # 0=no update, 1=replace with batch optimum
+    eps=1e-12,
+    alpha_min=1e-6,
+    alpha_max=1e6
+):
+    """
+    Stable, consistent alpha update for the SAME objective used in stress_and_grad_unit_torus:
+
+      Loss per pair: (alpha*r - d)^2
+
+    For a fixed batch {r_k, d_k}, the minimizer in alpha is:
+      alpha_hat = sum(d_k * r_k) / sum(r_k^2)
+
+    We compute alpha_hat once per minibatch and EMA it.
+
+    IMPORTANT: data[i,j] must be in the same units as (alpha * r). Since r <= ~0.707,
+    alpha roughly scales data by ~1/r.
+    """
+    n = data.shape[0]
+    np.random.seed(seed)
+
+    params = np.random.rand(n, 2)
+    alpha = alpha_init
+
+    for it in range(max_iters):
+        step_pos = 1.0 / (learning_rate + it)
+        if step_pos < 1e-4:
+            step_pos = 1e-4
+
+        num = 0.0  # sum d*r
+        den = 0.0  # sum r^2
+        used = 0
+
+        drawn = 0
+        while drawn < batch_pairs:
+            i = np.random.randint(0, n)
+            j = np.random.randint(0, n)
+            if i == j:
+                continue
+
+            d = data[i, j]
+
+            # compute grad and r CONSISTENTLY with alpha and unit-torus geometry
+            _, grad, r = stress_and_grad_unit_torus(params[i], params[j], d, alpha, eps)
+
+            # position update (antisymmetric)
+            params[i, 0] -= step_pos * grad[0]
+            params[i, 1] -= step_pos * grad[1]
+            params[j, 0] += step_pos * grad[0]
+            params[j, 1] += step_pos * grad[1]
+
+            # alpha batch statistics for the same loss (alpha*r - d)^2
+            num += d * r
+            den += r * r
+            used += 1
+
+            drawn += 1
+
+        # wrap once per outer iteration
+        params %= 1.0
+
+        # stable alpha update (closed-form + EMA)
+        if used > 0:
+            alpha_hat = num / (den + eps)
+
+            # hard bounds to prevent runaway from bad batches / bad data
+            if alpha_hat < alpha_min:
+                alpha_hat = alpha_min
+            elif alpha_hat > alpha_max:
+                alpha_hat = alpha_max
+
+            alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
+
+    return params, alpha
 
 @dataclass
 class MDSTorusProjector(TorusProjector):
@@ -160,31 +269,23 @@ class MDSTorusProjector(TorusProjector):
     learning_rate = 1
 
     def stochastic_gradient_descent(self, 
-                                max_iters=500, batch_size=1, data=None, 
-                                tolerance=1e-6, verbose=False,colors=None):
-
-        from itertools import combinations
-        import tqdm
-
-        lr = self.learning_rate
-
-        n = data.shape[0]
-        params = np.random.uniform(0,1,(n,2))
-
-        pairs = np.array(list(combinations(range(n), 2)))
-
-
-        for ind in tqdm.tqdm(range(max_iters)):
-            np.random.shuffle(pairs)
-            for i,j in pairs:
-                stress, grad = stress_and_grad(params[i], params[j], data[i,j])
-                update = (1/(lr+ind)) * grad
-                params[i] -= update 
-                params[j] += update
-                params[i] %= 1.0
-                params[j] %= 1.0
-                
-        return params
+                max_iters=10000, 
+                batch_size=4096, 
+                data=None, 
+                seed=0,
+                alpha_init=1.0
+            ):
+        
+        coords, alpha = sgd_minibatch_njit(
+            data=data,
+            learning_rate=self.learning_rate,
+            max_iters=max_iters,
+            batch_pairs=batch_size,
+            seed=seed,
+            alpha_init=1.0,
+        )
+        print(alpha)
+        return coords
     
     def _embed(self, D: np.ndarray) -> np.ndarray:
         from sklearn.manifold import MDS
