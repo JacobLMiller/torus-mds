@@ -266,31 +266,31 @@ def sgd_minibatch_njit(
 @dataclass
 class MDSTorusProjector(TorusProjector):
 
-    learning_rate = 1
+    learning_rate: float = 100.0
 
-    def stochastic_gradient_descent(self, 
-                max_iters=10000, 
-                batch_size=4096, 
-                data=None, 
+    alpha_: Optional[float] = field(default=None, init=False)
+
+    def stochastic_gradient_descent(self,
+                max_iters=10000,
+                batch_size=4096,
+                data=None,
                 seed=0,
                 alpha_init=1.0
             ):
-        
+
         coords, alpha = sgd_minibatch_njit(
             data=data,
             learning_rate=self.learning_rate,
             max_iters=max_iters,
             batch_pairs=batch_size,
             seed=seed,
-            alpha_init=1.0,
+            alpha_init=alpha_init,
         )
-        print(alpha)
-        return coords
-    
-    def _embed(self, D: np.ndarray) -> np.ndarray:
-        from sklearn.manifold import MDS
+        return coords, float(alpha)
 
-        X = self.stochastic_gradient_descent(data=D)
+    def _embed(self, D: np.ndarray) -> np.ndarray:
+        X, alpha = self.stochastic_gradient_descent(data=D)
+        self.alpha_ = alpha
         return X
 
 
