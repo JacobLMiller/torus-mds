@@ -1,3 +1,14 @@
+*.npy
+*.json
+3figures/
+.vscode/
+*.graphml
+*.png
+*.txt 
+*.gv
+*.npz
+*.csv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
