@@ -36,7 +36,7 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
         X = torus.torus_embedding_
 
     X = np.asarray(X, dtype=np.float64) % 1.0
-    idx = {n: i for i, n in enumerate(G.nodes())}
+    idx = {n: i for i, n in enumerate(G.nodes())} if G is not None else {}
 
     # Physical side lengths: alpha * r; fall back to 1 if not available
     alpha = torus.alpha_ if (torus is not None and torus.alpha_ is not None) else 1.0
@@ -53,7 +53,7 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
         fig, ax = plt.subplots()
 
     # edges — segments computed in [0,1)^2, then mapped to physical space
-    for u, v in G.edges():
+    for u, v in (G.edges() if G is not None else []):
         i, j = idx[u], idx[v]
         p, q = X[i], X[j]
         for a, b in torus_edge_segments(p, q):
