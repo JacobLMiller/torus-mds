@@ -100,6 +100,27 @@ VARIANTS: tuple[OptimizerVariant, ...] = (
         updates="synchronous inverse-sqrt visit normalization",
     ),
     OptimizerVariant(
+        name="sampled_unique_sync_hybridnorm",
+        description="Two-stage torus optimizer: early inverse-sqrt normalized synchronous updates, followed by per-node average normalization for refinement.",
+        sampling="unique unordered minibatch",
+        order="random minibatch, staged schedule",
+        updates="synchronous sqrtnorm then synchronous countnorm",
+    ),
+    OptimizerVariant(
+        name="stratified_distance_sync_sqrtnorm",
+        description="Inverse-sqrt normalized synchronous updates with minibatches balanced across short, medium, and long target graph distances.",
+        sampling="distance-stratified unique minibatch",
+        order="random within distance strata",
+        updates="synchronous inverse-sqrt visit normalization",
+    ),
+    OptimizerVariant(
+        name="coverage_unique_sync_sqrtnorm",
+        description="Inverse-sqrt normalized synchronous updates with minibatches assembled from repeated near-perfect node-covering rounds.",
+        sampling="coverage-constrained unique minibatch",
+        order="random node-cover rounds",
+        updates="synchronous inverse-sqrt visit normalization",
+    ),
+    OptimizerVariant(
         name="anchor_unique_online",
         description="Anchor-node sweep: random node order, a few unique partners per anchor, immediate pairwise updates.",
         sampling="anchor-driven unique partners",
@@ -199,7 +220,7 @@ def _build_knn_graph(points: np.ndarray, k: int) -> nx.Graph:
 
 def build_representative_benchmarks(
     *,
-    chen_indices: Sequence[int] = (1, 5, 10, 15, 20),
+    chen_indices: Sequence[int] | None = None,
     include_large_grid: bool = True,
     planted_seed: int = 0,
 ) -> list[BenchmarkSpec]:
@@ -221,6 +242,8 @@ def build_representative_benchmarks(
         )
 
     chen_graphs = sorted(graphio.load_chen_graphs("chengraphs/*.json"), key=lambda item: int(item[0]))
+    if chen_indices is None:
+        chen_indices = tuple(range(1, len(chen_graphs) + 1))
     for chen_index in chen_indices:
         name, graph, given_layout, distances = chen_graphs[chen_index - 1]
         specs.append(
@@ -392,8 +415,7 @@ def build_diverse_control_benchmarks(*, seed: int = 0) -> list[BenchmarkSpec]:
 
     # Keep a few previous families for continuity.
     chen_graphs = sorted(graphio.load_chen_graphs("chengraphs/*.json"), key=lambda item: int(item[0]))
-    for chen_index in (1, 10, 20):
-        name, graph, given_layout, distances = chen_graphs[chen_index - 1]
+    for name, graph, given_layout, distances in chen_graphs:
         specs.append(
             BenchmarkSpec(
                 name=f"chen_{name}",
@@ -500,6 +522,104 @@ def _build_sampled_unique_pair_sequence(n: int, epochs: int, batch_pairs: int, s
         take = min(batch_pairs, total_pairs)
         choice = rng.choice(total_pairs, size=take, replace=False)
         items.append(pairs[choice])
+    return _to_numba_list(items)
+
+
+def _build_distance_stratified_pair_sequence(data: np.ndarray, epochs: int, batch_pairs: int, seed: int) -> NumbaList:
+    rng = np.random.default_rng(seed)
+    pairs = _all_unique_pairs(data.shape[0])
+    total_pairs = len(pairs)
+    take = min(batch_pairs, total_pairs)
+    if total_pairs == 0:
+        return _to_numba_list([np.empty((0, 2), dtype=np.int32) for _ in range(epochs)])
+
+    pair_distances = data[pairs[:, 0], pairs[:, 1]]
+    positive = pair_distances[pair_distances > 0]
+    if positive.size == 0:
+        return _build_sampled_unique_pair_sequence(data.shape[0], epochs, batch_pairs, seed)
+
+    q1, q2 = np.quantile(positive, [1.0 / 3.0, 2.0 / 3.0])
+    bins = [
+        np.flatnonzero(pair_distances <= q1),
+        np.flatnonzero((pair_distances > q1) & (pair_distances <= q2)),
+        np.flatnonzero(pair_distances > q2),
+    ]
+    bins = [b for b in bins if b.size > 0]
+    if len(bins) < 2:
+        return _build_sampled_unique_pair_sequence(data.shape[0], epochs, batch_pairs, seed)
+
+    items: list[np.ndarray] = []
+    base = take // len(bins)
+    remainder = take % len(bins)
+    for _ in range(epochs):
+        selected: list[int] = []
+        used = np.zeros(total_pairs, dtype=bool)
+        for bin_index, bin_ids in enumerate(bins):
+            target = base + (1 if bin_index < remainder else 0)
+            if target <= 0:
+                continue
+            local_take = min(target, bin_ids.size)
+            choice = rng.choice(bin_ids, size=local_take, replace=False)
+            selected.extend(choice.tolist())
+            used[choice] = True
+
+        if len(selected) < take:
+            remaining = np.flatnonzero(~used)
+            extra_take = min(take - len(selected), remaining.size)
+            if extra_take > 0:
+                extra = rng.choice(remaining, size=extra_take, replace=False)
+                selected.extend(extra.tolist())
+        items.append(pairs[np.asarray(selected, dtype=np.int32)])
+    return _to_numba_list(items)
+
+
+def _build_coverage_constrained_pair_sequence(n: int, epochs: int, batch_pairs: int, seed: int) -> NumbaList:
+    rng = np.random.default_rng(seed)
+    total_pairs = n * (n - 1) // 2
+    take = min(batch_pairs, total_pairs)
+    items: list[np.ndarray] = []
+    nodes = np.arange(n, dtype=np.int32)
+    for _ in range(epochs):
+        selected: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+
+        while len(selected) < take:
+            perm = rng.permutation(nodes)
+            for start in range(0, max(len(perm) - 1, 0), 2):
+                i = int(perm[start])
+                j = int(perm[start + 1])
+                if i == j:
+                    continue
+                pair = (i, j) if i < j else (j, i)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                selected.append(pair)
+                if len(selected) >= take:
+                    break
+            if len(selected) >= take:
+                break
+
+            if len(seen) >= total_pairs:
+                break
+
+            # Fill gaps when repeated matching rounds stall.
+            anchors = rng.permutation(nodes)
+            for i in anchors:
+                if len(selected) >= take:
+                    break
+                candidates = rng.permutation(nodes)
+                for j in candidates:
+                    if i == j:
+                        continue
+                    pair = (int(i), int(j)) if i < j else (int(j), int(i))
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                    selected.append(pair)
+                    break
+
+        items.append(np.asarray(selected, dtype=np.int32))
     return _to_numba_list(items)
 
 
@@ -947,6 +1067,158 @@ def _sampled_unique_sync(
     return coords, float(alpha), float(r0), float(r1), pair_evals, len(sequence)
 
 
+def _sampled_unique_sync_hybridnorm(
+    data: np.ndarray,
+    learning_rate: float,
+    *,
+    max_iters: int,
+    batch_pairs: int,
+    seed: int,
+    alpha_init: float,
+    alpha_ema: float,
+    eps: float,
+    alpha_min: float,
+    alpha_max: float,
+    r0_init: float,
+    r1_init: float,
+    learn_mode: int,
+    geom_lr: float,
+    geom_min: float,
+    theta: float,
+) -> tuple[np.ndarray, float, float, float, int, int]:
+    first_stage = max(1, int(math.ceil(0.65 * max_iters)))
+    second_stage = max(1, max_iters - first_stage)
+
+    seq_first = _build_sampled_unique_pair_sequence(data.shape[0], first_stage, batch_pairs, seed)
+    init_params = _legacy_random_init(data.shape[0], seed)
+    coords, alpha, r0, r1 = _run_pair_sequence_sync_njit(
+        data,
+        seq_first,
+        learning_rate,
+        init_params,
+        2,
+        alpha_init,
+        alpha_ema,
+        eps,
+        alpha_min,
+        alpha_max,
+        r0_init,
+        r1_init,
+        learn_mode,
+        geom_lr,
+        geom_min,
+        theta,
+    )
+
+    seq_second = _build_sampled_unique_pair_sequence(data.shape[0], second_stage, batch_pairs, seed + 1009)
+    coords, alpha, r0, r1 = _run_pair_sequence_sync_njit(
+        data,
+        seq_second,
+        learning_rate + first_stage,
+        coords,
+        1,
+        alpha,
+        alpha_ema,
+        eps,
+        alpha_min,
+        alpha_max,
+        r0,
+        r1,
+        learn_mode,
+        geom_lr,
+        geom_min,
+        theta,
+    )
+    pair_evals = sum(int(seq.shape[0]) for seq in seq_first) + sum(int(seq.shape[0]) for seq in seq_second)
+    return coords, float(alpha), float(r0), float(r1), pair_evals, first_stage + second_stage
+
+
+def _stratified_distance_sync_sqrtnorm(
+    data: np.ndarray,
+    learning_rate: float,
+    *,
+    max_iters: int,
+    batch_pairs: int,
+    seed: int,
+    alpha_init: float,
+    alpha_ema: float,
+    eps: float,
+    alpha_min: float,
+    alpha_max: float,
+    r0_init: float,
+    r1_init: float,
+    learn_mode: int,
+    geom_lr: float,
+    geom_min: float,
+    theta: float,
+) -> tuple[np.ndarray, float, float, float, int, int]:
+    sequence = _build_distance_stratified_pair_sequence(data, max_iters, batch_pairs, seed)
+    init_params = _legacy_random_init(data.shape[0], seed)
+    coords, alpha, r0, r1 = _run_pair_sequence_sync_njit(
+        data,
+        sequence,
+        learning_rate,
+        init_params,
+        2,
+        alpha_init,
+        alpha_ema,
+        eps,
+        alpha_min,
+        alpha_max,
+        r0_init,
+        r1_init,
+        learn_mode,
+        geom_lr,
+        geom_min,
+        theta,
+    )
+    pair_evals = sum(int(seq.shape[0]) for seq in sequence)
+    return coords, float(alpha), float(r0), float(r1), pair_evals, len(sequence)
+
+
+def _coverage_unique_sync_sqrtnorm(
+    data: np.ndarray,
+    learning_rate: float,
+    *,
+    max_iters: int,
+    batch_pairs: int,
+    seed: int,
+    alpha_init: float,
+    alpha_ema: float,
+    eps: float,
+    alpha_min: float,
+    alpha_max: float,
+    r0_init: float,
+    r1_init: float,
+    learn_mode: int,
+    geom_lr: float,
+    geom_min: float,
+    theta: float,
+) -> tuple[np.ndarray, float, float, float, int, int]:
+    sequence = _build_coverage_constrained_pair_sequence(data.shape[0], max_iters, batch_pairs, seed)
+    init_params = _legacy_random_init(data.shape[0], seed)
+    coords, alpha, r0, r1 = _run_pair_sequence_sync_njit(
+        data,
+        sequence,
+        learning_rate,
+        init_params,
+        2,
+        alpha_init,
+        alpha_ema,
+        eps,
+        alpha_min,
+        alpha_max,
+        r0_init,
+        r1_init,
+        learn_mode,
+        geom_lr,
+        geom_min,
+        theta,
+    )
+    pair_evals = sum(int(seq.shape[0]) for seq in sequence)
+    return coords, float(alpha), float(r0), float(r1), pair_evals, len(sequence)
+
+
 def _anchor_unique_online(
     data: np.ndarray,
     learning_rate: float,
@@ -1122,6 +1394,52 @@ def run_optimizer_variant_euclidean_control(
             alpha_min,
             alpha_max,
         )
+    elif variant_name == "sampled_unique_sync_hybridnorm":
+        first_stage = max(1, int(math.ceil(0.65 * max_iters)))
+        second_stage = max(1, max_iters - first_stage)
+
+        seq_first = _build_sampled_unique_pair_sequence(n, first_stage, batch_pairs, seed)
+        coords, alpha = _run_pair_sequence_sync_euclidean_njit(
+            data,
+            seq_first,
+            learning_rate,
+            init_params,
+            2,
+            alpha_init,
+            alpha_ema,
+            eps,
+            alpha_min,
+            alpha_max,
+        )
+
+        seq_second = _build_sampled_unique_pair_sequence(n, second_stage, batch_pairs, seed + 1009)
+        coords, alpha = _run_pair_sequence_sync_euclidean_njit(
+            data,
+            seq_second,
+            learning_rate + first_stage,
+            coords,
+            1,
+            alpha,
+            alpha_ema,
+            eps,
+            alpha_min,
+            alpha_max,
+        )
+        sequence = list(seq_first) + list(seq_second)
+    elif variant_name == "stratified_distance_sync_sqrtnorm":
+        sequence = _build_distance_stratified_pair_sequence(data, max_iters, batch_pairs, seed)
+        coords, alpha = _run_pair_sequence_sync_euclidean_njit(
+            data,
+            sequence,
+            learning_rate,
+            init_params,
+            2,
+            alpha_init,
+            alpha_ema,
+            eps,
+            alpha_min,
+            alpha_max,
+        )
     elif variant_name == "anchor_unique_online":
         sequence = _build_anchor_unique_pair_sequence(n, max_iters, batch_pairs, seed)
         coords, alpha = _run_pair_sequence_online_euclidean_njit(
@@ -1166,6 +1484,9 @@ RUNNERS: dict[str, Callable[..., tuple[np.ndarray, float, float, float, int, int
     "sampled_unique_sync_batchavg": lambda *args, **kwargs: _sampled_unique_sync(*args, norm_mode=0, **kwargs),
     "sampled_unique_sync_countnorm": lambda *args, **kwargs: _sampled_unique_sync(*args, norm_mode=1, **kwargs),
     "sampled_unique_sync_sqrtnorm": lambda *args, **kwargs: _sampled_unique_sync(*args, norm_mode=2, **kwargs),
+    "sampled_unique_sync_hybridnorm": _sampled_unique_sync_hybridnorm,
+    "stratified_distance_sync_sqrtnorm": _stratified_distance_sync_sqrtnorm,
+    "coverage_unique_sync_sqrtnorm": _coverage_unique_sync_sqrtnorm,
     "anchor_unique_online": _anchor_unique_online,
     "full_sweep_sync_sqrtnorm": _full_sweep_sync_sqrtnorm,
 }
@@ -1195,6 +1516,15 @@ def warmup_variants() -> None:
         if variant.max_n is not None and distances.shape[0] > variant.max_n:
             continue
         RUNNERS[variant_name](distances, 1.0, **kwargs)
+    for variant_name in (
+        "baseline_random_minibatch",
+        "sampled_unique_online",
+        "sampled_unique_sync_batchavg",
+        "sampled_unique_sync_countnorm",
+        "sampled_unique_sync_sqrtnorm",
+        "anchor_unique_online",
+        "full_sweep_sync_sqrtnorm",
+    ):
         run_optimizer_variant_euclidean_control(
             distances,
             variant_name,
@@ -1384,6 +1714,7 @@ def benchmark_objective_controls(
     specs: Sequence[BenchmarkSpec],
     *,
     variant_names: Sequence[str] | None = None,
+    objectives: Sequence[str] = ("torus", "euclidean"),
     seeds: Sequence[int] = (0, 1, 2),
     learning_rate: float = 1.0,
     max_iters: int = 120,
@@ -1396,7 +1727,7 @@ def benchmark_objective_controls(
         variant_names = [variant.name for variant in VARIANTS]
 
     rows: list[dict[str, Any]] = []
-    for objective in ("torus", "euclidean"):
+    for objective in objectives:
         for spec in specs:
             n_nodes = spec.graph.number_of_nodes()
             for seed in seeds:
@@ -1517,96 +1848,114 @@ def diagnose_torus_optimization(
     n = data.shape[0]
     if variant_name == "baseline_random_minibatch":
         sequence = _build_random_replacement_pair_sequence(n, max_iters, batch_pairs, seed)
-        norm_mode = -1
+        stages = [(sequence, -1, float(learning_rate))]
     elif variant_name == "sampled_unique_sync_batchavg":
         sequence = _build_sampled_unique_pair_sequence(n, max_iters, batch_pairs, seed)
-        norm_mode = 0
+        stages = [(sequence, 0, float(learning_rate))]
     elif variant_name == "sampled_unique_sync_countnorm":
         sequence = _build_sampled_unique_pair_sequence(n, max_iters, batch_pairs, seed)
-        norm_mode = 1
+        stages = [(sequence, 1, float(learning_rate))]
     elif variant_name == "sampled_unique_sync_sqrtnorm":
         sequence = _build_sampled_unique_pair_sequence(n, max_iters, batch_pairs, seed)
-        norm_mode = 2
+        stages = [(sequence, 2, float(learning_rate))]
+    elif variant_name == "sampled_unique_sync_hybridnorm":
+        first_stage = max(1, int(math.ceil(0.65 * max_iters)))
+        second_stage = max(1, max_iters - first_stage)
+        seq_first = _build_sampled_unique_pair_sequence(n, first_stage, batch_pairs, seed)
+        seq_second = _build_sampled_unique_pair_sequence(n, second_stage, batch_pairs, seed + 1009)
+        stages = [
+            (seq_first, 2, float(learning_rate)),
+            (seq_second, 1, float(learning_rate + first_stage)),
+        ]
+    elif variant_name == "stratified_distance_sync_sqrtnorm":
+        sequence = _build_distance_stratified_pair_sequence(data, max_iters, batch_pairs, seed)
+        stages = [(sequence, 2, float(learning_rate))]
     else:
-        raise ValueError(f"Diagnostics currently implemented for baseline and sync variants only, got {variant_name!r}")
+        raise ValueError(
+            "Diagnostics currently implemented for baseline, sync variants, hybridnorm, "
+            f"and stratified sqrtnorm only, got {variant_name!r}"
+        )
 
     params = _legacy_random_init(n, seed)
     alpha = float(alpha_init)
     r0 = 1.0
     r1 = 1.0
     rows: list[dict[str, Any]] = []
-    for epoch, seq in enumerate(sequence):
-        step_pos = max(1.0 / (learning_rate + epoch), 1e-4)
-        counts = np.zeros(n, dtype=np.int32)
-        grad_acc = np.zeros((n, 2), dtype=np.float64)
-        move_sum = np.zeros(n, dtype=np.float64)
-        pair_grad_norms = np.zeros(seq.shape[0], dtype=np.float64)
-        num = 0.0
-        den = 0.0
+    epoch = 0
+    for sequence, norm_mode, stage_learning_rate in stages:
+        for seq in sequence:
+            step_pos = max(1.0 / (stage_learning_rate + epoch), 1e-4)
+            counts = np.zeros(n, dtype=np.int32)
+            grad_acc = np.zeros((n, 2), dtype=np.float64)
+            move_sum = np.zeros(n, dtype=np.float64)
+            pair_grad_norms = np.zeros(seq.shape[0], dtype=np.float64)
+            num = 0.0
+            den = 0.0
 
-        for k in range(seq.shape[0]):
-            i = int(seq[k, 0])
-            j = int(seq[k, 1])
-            d = float(data[i, j])
-            _, grad, dist, _, _ = stress_and_grad_rect_torus(params[i], params[j], d, alpha, r0, r1, 1e-12, theta)
-            grad_norm = float(np.linalg.norm(grad))
-            pair_grad_norms[k] = grad_norm
-            counts[i] += 1
-            counts[j] += 1
-            num += d * dist
-            den += dist * dist
+            for k in range(seq.shape[0]):
+                i = int(seq[k, 0])
+                j = int(seq[k, 1])
+                d = float(data[i, j])
+                _, grad, dist, _, _ = stress_and_grad_rect_torus(params[i], params[j], d, alpha, r0, r1, 1e-12, theta)
+                grad_norm = float(np.linalg.norm(grad))
+                pair_grad_norms[k] = grad_norm
+                counts[i] += 1
+                counts[j] += 1
+                num += d * dist
+                den += dist * dist
 
-            if norm_mode < 0:
-                delta = step_pos * grad
-                params[i] -= delta
-                params[j] += delta
-                move_sum[i] += float(np.linalg.norm(delta))
-                move_sum[j] += float(np.linalg.norm(delta))
-            else:
-                grad_acc[i] += grad
-                grad_acc[j] -= grad
-
-        if norm_mode >= 0:
-            avg_count = 2.0 * seq.shape[0] / n
-            for i in range(n):
-                if counts[i] == 0:
-                    continue
-                if norm_mode == 0:
-                    scale = step_pos / seq.shape[0]
-                elif norm_mode == 1:
-                    scale = step_pos / counts[i]
+                if norm_mode < 0:
+                    delta = step_pos * grad
+                    params[i] -= delta
+                    params[j] += delta
+                    move_sum[i] += float(np.linalg.norm(delta))
+                    move_sum[j] += float(np.linalg.norm(delta))
                 else:
-                    scale = step_pos * avg_count * math.sqrt(avg_count / counts[i]) / seq.shape[0]
-                delta = scale * grad_acc[i]
-                params[i] -= delta
-                move_sum[i] += float(np.linalg.norm(delta))
+                    grad_acc[i] += grad
+                    grad_acc[j] -= grad
 
-        params %= 1.0
+            if norm_mode >= 0:
+                avg_count = 2.0 * seq.shape[0] / n
+                for i in range(n):
+                    if counts[i] == 0:
+                        continue
+                    if norm_mode == 0:
+                        scale = step_pos / seq.shape[0]
+                    elif norm_mode == 1:
+                        scale = step_pos / counts[i]
+                    else:
+                        scale = step_pos * avg_count * math.sqrt(avg_count / counts[i]) / seq.shape[0]
+                    delta = scale * grad_acc[i]
+                    params[i] -= delta
+                    move_sum[i] += float(np.linalg.norm(delta))
 
-        alpha_hat = num / (den + 1e-12)
-        alpha_hat = max(1e-6, min(1e6, alpha_hat))
-        alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
+            params %= 1.0
 
-        mean_visits = float(counts.mean())
-        visit_std = float(counts.std())
-        rows.append(
-            {
-                "epoch": epoch,
-                "variant": variant_name,
-                "seed": seed,
-                "visit_mean": mean_visits,
-                "visit_std": visit_std,
-                "visit_cv": visit_std / mean_visits if mean_visits > 0 else 0.0,
-                "visit_min": int(counts.min()),
-                "visit_max": int(counts.max()),
-                "mean_pair_grad_norm": float(pair_grad_norms.mean()) if pair_grad_norms.size else 0.0,
-                "median_pair_grad_norm": float(np.median(pair_grad_norms)) if pair_grad_norms.size else 0.0,
-                "mean_node_move_norm": float(move_sum.mean()),
-                "median_node_move_norm": float(np.median(move_sum)),
-                "max_node_move_norm": float(move_sum.max()),
-                "alpha": alpha,
-            }
-        )
+            alpha_hat = num / (den + 1e-12)
+            alpha_hat = max(1e-6, min(1e6, alpha_hat))
+            alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
+
+            mean_visits = float(counts.mean())
+            visit_std = float(counts.std())
+            rows.append(
+                {
+                    "epoch": epoch,
+                    "variant": variant_name,
+                    "seed": seed,
+                    "visit_mean": mean_visits,
+                    "visit_std": visit_std,
+                    "visit_cv": visit_std / mean_visits if mean_visits > 0 else 0.0,
+                    "visit_min": int(counts.min()),
+                    "visit_max": int(counts.max()),
+                    "mean_pair_grad_norm": float(pair_grad_norms.mean()) if pair_grad_norms.size else 0.0,
+                    "median_pair_grad_norm": float(np.median(pair_grad_norms)) if pair_grad_norms.size else 0.0,
+                    "mean_node_move_norm": float(move_sum.mean()),
+                    "median_node_move_norm": float(np.median(move_sum)),
+                    "max_node_move_norm": float(move_sum.max()),
+                    "alpha": alpha,
+                }
+            )
+            epoch += 1
     return pd.DataFrame(rows)
 
 
