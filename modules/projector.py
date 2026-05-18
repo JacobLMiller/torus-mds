@@ -5,8 +5,11 @@ from typing import Optional, Literal, Tuple
 
 import numpy as np
 import numba
+from numba.typed import List as NumbaList
 
-from .geometry import stress_and_grad_rect_torus, torus_grad
+from .geometry import grad_rect_torus, torus_grad
+
+DEFAULT_SEQUENCE_CHUNK_EPOCHS = 128
 
 
 def _check_distance_matrix(D: np.ndarray) -> np.ndarray:
@@ -37,8 +40,29 @@ def _wrap_unit_square(X: np.ndarray) -> np.ndarray:
     return np.asarray(X, dtype=np.float64) % 1.0
 
 
+def _all_unique_pairs(n: int) -> np.ndarray:
+    ii, jj = np.triu_indices(n, 1)
+    return np.column_stack([ii, jj]).astype(np.int32, copy=False)
+
+
+def _build_sampled_unique_pair_sequence_from_pairs(
+    pairs: np.ndarray,
+    rng: np.random.Generator,
+    epochs: int,
+    batch_pairs: int,
+) -> NumbaList:
+    total_pairs = len(pairs)
+    take = min(batch_pairs, total_pairs)
+    result = NumbaList()
+    for _ in range(epochs):
+        choice = rng.choice(total_pairs, size=take, replace=False)
+        result.append(np.asarray(pairs[choice], dtype=np.int32))
+    return result
+
+
+
 @numba.njit(cache=True, fastmath=True)
-def sgd_minibatch_njit(
+def _sgd_minibatch_njit_legacy(
     data,
     learning_rate,
     max_iters=500,
@@ -51,7 +75,7 @@ def sgd_minibatch_njit(
     alpha_max=1e6,
     r0_init=1.0,
     r1_init=1.0,
-    learn_mode=0,   # 0=fixed, 1=alpha, 2=square, 3=rectangular
+    learn_mode=0,   # 0=fixed, 1=alpha, 2=square, 3=rectangular, 4=alpha_aspect
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
@@ -73,9 +97,24 @@ def sgd_minibatch_njit(
     alpha = alpha_init
     r0 = r0_init
     r1 = r1_init
+    if learn_mode == 4:
+        aspect_scale = np.sqrt(max(geom_min, r0 * r1))
+        alpha *= aspect_scale
+        log_aspect = np.log(max(geom_min, r1)) - np.log(max(geom_min, r0))
+        if log_aspect < -6.0:
+            log_aspect = -6.0
+        elif log_aspect > 6.0:
+            log_aspect = 6.0
+        r0 = np.exp(-0.5 * log_aspect)
+        r1 = np.exp(0.5 * log_aspect)
+    else:
+        log_aspect = 0.0
 
     for it in range(max_iters):
         step_pos = max(1.0 / (learning_rate + it), 1e-4)
+        if learn_mode == 4:
+            r0 = np.exp(-0.5 * log_aspect)
+            r1 = np.exp(0.5 * log_aspect)
 
         num = 0.0
         den = 0.0
@@ -91,14 +130,14 @@ def sgd_minibatch_njit(
                 continue
 
             d = data[i, j]
-            _, grad, dist, gr0_k, gr1_k = stress_and_grad_rect_torus(
+            g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
                 params[i], params[j], d, alpha, r0, r1, eps, theta
             )
 
-            params[i, 0] -= step_pos * grad[0]
-            params[i, 1] -= step_pos * grad[1]
-            params[j, 0] += step_pos * grad[0]
-            params[j, 1] += step_pos * grad[1]
+            params[i, 0] -= step_pos * g0
+            params[i, 1] -= step_pos * g1
+            params[j, 0] += step_pos * g0
+            params[j, 1] += step_pos * g1
 
             num += d * dist
             den += dist * dist
@@ -121,7 +160,181 @@ def sgd_minibatch_njit(
             elif learn_mode == 3:
                 r0 = max(geom_min, r0 - geom_lr * gr0_sum / used)
                 r1 = max(geom_min, r1 - geom_lr * gr1_sum / used)
+            elif learn_mode == 4:
+                alpha_hat = num / (den + eps)
+                alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
+                alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
+                grad_s = (-0.5 * gr0_sum * r0 + 0.5 * gr1_sum * r1) / used
+                log_aspect -= geom_lr * grad_s
+                if log_aspect < -6.0:
+                    log_aspect = -6.0
+                elif log_aspect > 6.0:
+                    log_aspect = 6.0
+                r0 = np.exp(-0.5 * log_aspect)
+                r1 = np.exp(0.5 * log_aspect)
 
+    return params, alpha, r0, r1
+
+
+@numba.njit(cache=True, fastmath=True)
+def _run_pair_sequence_online_njit(
+    data,
+    pair_sequence,
+    learning_rate,
+    init_params,
+    start_iter=0,
+    alpha_init=1.0,
+    alpha_ema=0.05,
+    eps=1e-12,
+    alpha_min=1e-6,
+    alpha_max=1e6,
+    r0_init=1.0,
+    r1_init=1.0,
+    learn_mode=0,   # 0=fixed, 1=alpha, 2=square, 3=rectangular, 4=alpha_aspect
+    geom_lr=0.01,
+    geom_min=1e-6,
+    theta=np.pi / 2,
+):
+    params = init_params.copy()
+    alpha = alpha_init
+    r0 = r0_init
+    r1 = r1_init
+    if learn_mode == 4:
+        aspect_scale = np.sqrt(max(geom_min, r0 * r1))
+        alpha *= aspect_scale
+        log_aspect = np.log(max(geom_min, r1)) - np.log(max(geom_min, r0))
+        if log_aspect < -6.0:
+            log_aspect = -6.0
+        elif log_aspect > 6.0:
+            log_aspect = 6.0
+        r0 = np.exp(-0.5 * log_aspect)
+        r1 = np.exp(0.5 * log_aspect)
+    else:
+        log_aspect = 0.0
+    epochs = len(pair_sequence)
+
+    for it in range(epochs):
+        step_pos = max(1.0 / (learning_rate + start_iter + it), 1e-4)
+        if learn_mode == 4:
+            r0 = np.exp(-0.5 * log_aspect)
+            r1 = np.exp(0.5 * log_aspect)
+
+        seq = pair_sequence[it]
+        used = seq.shape[0]
+
+        num = 0.0
+        den = 0.0
+        gr0_sum = 0.0
+        gr1_sum = 0.0
+        for k in range(used):
+            i = seq[k, 0]
+            j = seq[k, 1]
+
+            d = data[i, j]
+            g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
+                params[i], params[j], d, alpha, r0, r1, eps, theta
+            )
+
+            params[i, 0] -= step_pos * g0
+            params[i, 1] -= step_pos * g1
+            params[j, 0] += step_pos * g0
+            params[j, 1] += step_pos * g1
+
+            num += d * dist
+            den += dist * dist
+            gr0_sum += gr0_k
+            gr1_sum += gr1_k
+
+        params %= 1.0
+
+        if used > 0:
+            if learn_mode == 1:
+                alpha_hat = num / (den + eps)
+                alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
+                alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
+            elif learn_mode == 2:
+                r = max(geom_min, r0 - geom_lr * (gr0_sum + gr1_sum) / used)
+                r0 = r
+                r1 = r
+            elif learn_mode == 3:
+                r0 = max(geom_min, r0 - geom_lr * gr0_sum / used)
+                r1 = max(geom_min, r1 - geom_lr * gr1_sum / used)
+            elif learn_mode == 4:
+                alpha_hat = num / (den + eps)
+                alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
+                alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
+                grad_s = (-0.5 * gr0_sum * r0 + 0.5 * gr1_sum * r1) / used
+                log_aspect -= geom_lr * grad_s
+                if log_aspect < -6.0:
+                    log_aspect = -6.0
+                elif log_aspect > 6.0:
+                    log_aspect = 6.0
+                r0 = np.exp(-0.5 * log_aspect)
+                r1 = np.exp(0.5 * log_aspect)
+
+    return params, alpha, r0, r1
+
+
+def sgd_minibatch_njit(
+    data,
+    learning_rate,
+    max_iters=500,
+    batch_pairs=4096,
+    seed=0,
+    alpha_init=1.0,
+    alpha_ema=0.05,
+    eps=1e-12,
+    alpha_min=1e-6,
+    alpha_max=1e6,
+    r0_init=1.0,
+    r1_init=1.0,
+    learn_mode=0,   # 0=fixed, 1=alpha, 2=square, 3=rectangular, 4=alpha_aspect
+    geom_lr=0.01,
+    geom_min=1e-6,
+    theta=np.pi / 2,
+    chunk_epochs=DEFAULT_SEQUENCE_CHUNK_EPOCHS,
+):
+    """
+    Minibatch SGD for torus MDS using online updates over unique sampled pairs.
+
+    This replaces the older with-replacement pair sampling
+
+    Returns: (params, alpha, r0, r1)
+    """
+    data = np.asarray(data, dtype=np.float64)
+    n = data.shape[0]
+    params = np.random.RandomState(seed).rand(n, 2).astype(np.float64, copy=False)
+    alpha = float(alpha_init)
+    r0 = float(r0_init)
+    r1 = float(r1_init)
+    if max_iters <= 0 or n < 2:
+        return params, alpha, r0, r1
+
+    rng = np.random.default_rng(seed)
+    pairs = _all_unique_pairs(n)
+    start_iter = 0
+    while start_iter < max_iters:
+        epochs = min(chunk_epochs, max_iters - start_iter)
+        sequence = _build_sampled_unique_pair_sequence_from_pairs(pairs, rng, epochs, batch_pairs)
+        params, alpha, r0, r1 = _run_pair_sequence_online_njit(
+            data=data,
+            pair_sequence=sequence,
+            learning_rate=learning_rate,
+            init_params=params,
+            start_iter=start_iter,
+            alpha_init=alpha,
+            alpha_ema=alpha_ema,
+            eps=eps,
+            alpha_min=alpha_min,
+            alpha_max=alpha_max,
+            r0_init=r0,
+            r1_init=r1,
+            learn_mode=learn_mode,
+            geom_lr=geom_lr,
+            geom_min=geom_min,
+            theta=theta,
+        )
+        start_iter += epochs
     return params, alpha, r0, r1
 
 
@@ -190,19 +403,26 @@ class MDSTorusProjector(TorusProjector):
             alpha_init=1.0,
             r0_init=1.0,
             r1_init=1.0,
-            learn_mode='alpha',   # 'fixed' | 'alpha' | 'square' | 'rectangular'
+            learn_mode='alpha',   # 'fixed' | 'alpha' | 'square' | 'rectangular' | 'alpha_aspect'
             geom_lr=0.01,
+            sampled_unique=True,
             theta=90.0,           # torus angle in degrees; must be in [60, 120]
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
-        if theta != 90.0 and learn_mode == 'rectangular':
+        if theta != 90.0 and learn_mode in ('rectangular', 'alpha_aspect'):
             raise ValueError(
                 "theta != 90 requires equal side lengths; use learn_mode='alpha' or 'square'"
             )
         theta_rad = float(np.radians(theta))
-        mode_int = {'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3}[learn_mode]
-        coords, alpha, r0, r1 = sgd_minibatch_njit(
+        mode_int = {'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3, 'alpha_aspect': 4}[learn_mode]
+
+        if sampled_unique:
+            sgd_fn = sgd_minibatch_njit # sample pairs without replacement
+        else:
+            sgd_fn = _sgd_minibatch_njit_legacy # sample pairs with replacement
+
+        coords, alpha, r0, r1 = sgd_fn(
             data=data,
             learning_rate=self.learning_rate,
             max_iters=max_iters,
