@@ -34,3 +34,10 @@ from .graphio import (
     parse_chen_json,
     load_chen_graphs,
 )
+from .comparison import (
+    GraphComparisonSpec,
+    LayoutComparisonResult,
+    compare_standalone_vs_mdstorus_graphs,
+    run_standalone_vs_mdstorus,
+    summarize_standalone_vs_mdstorus,
+)
