@@ -7,7 +7,7 @@ import numpy as np
 import numba
 from numba.typed import List as NumbaList
 
-from .geometry import stress_and_grad_rect_torus, torus_grad
+from .geometry import grad_rect_torus, torus_grad
 
 DEFAULT_SEQUENCE_CHUNK_EPOCHS = 128
 
@@ -130,14 +130,14 @@ def _sgd_minibatch_njit_legacy(
                 continue
 
             d = data[i, j]
-            _, grad, dist, gr0_k, gr1_k = stress_and_grad_rect_torus(
+            g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
                 params[i], params[j], d, alpha, r0, r1, eps, theta
             )
 
-            params[i, 0] -= step_pos * grad[0]
-            params[i, 1] -= step_pos * grad[1]
-            params[j, 0] += step_pos * grad[0]
-            params[j, 1] += step_pos * grad[1]
+            params[i, 0] -= step_pos * g0
+            params[i, 1] -= step_pos * g1
+            params[j, 0] += step_pos * g0
+            params[j, 1] += step_pos * g1
 
             num += d * dist
             den += dist * dist
@@ -231,14 +231,14 @@ def _run_pair_sequence_online_njit(
             j = seq[k, 1]
 
             d = data[i, j]
-            _, grad, dist, gr0_k, gr1_k = stress_and_grad_rect_torus(
+            g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
                 params[i], params[j], d, alpha, r0, r1, eps, theta
             )
 
-            params[i, 0] -= step_pos * grad[0]
-            params[i, 1] -= step_pos * grad[1]
-            params[j, 0] += step_pos * grad[0]
-            params[j, 1] += step_pos * grad[1]
+            params[i, 0] -= step_pos * g0
+            params[i, 1] -= step_pos * g1
+            params[j, 0] += step_pos * g0
+            params[j, 1] += step_pos * g1
 
             num += d * dist
             den += dist * dist
