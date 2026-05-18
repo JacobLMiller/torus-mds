@@ -405,6 +405,7 @@ class MDSTorusProjector(TorusProjector):
             r1_init=1.0,
             learn_mode='alpha',   # 'fixed' | 'alpha' | 'square' | 'rectangular' | 'alpha_aspect'
             geom_lr=0.01,
+            sampled_unique=True,
             theta=90.0,           # torus angle in degrees; must be in [60, 120]
     ):
         if not (60.0 <= theta <= 120.0):
@@ -415,7 +416,13 @@ class MDSTorusProjector(TorusProjector):
             )
         theta_rad = float(np.radians(theta))
         mode_int = {'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3, 'alpha_aspect': 4}[learn_mode]
-        coords, alpha, r0, r1 = sgd_minibatch_njit(
+
+        if sampled_unique:
+            sgd_fn = sgd_minibatch_njit # sample pairs without replacement
+        else:
+            sgd_fn = _sgd_minibatch_njit_legacy # sample pairs with replacement
+
+        coords, alpha, r0, r1 = sgd_fn(
             data=data,
             learning_rate=self.learning_rate,
             max_iters=max_iters,
