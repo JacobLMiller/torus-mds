@@ -38,6 +38,7 @@ from modules.metrics import (
     geodesic_stress,
 )
 from modules.projector import MDSTorusProjector
+from standalone_toruslayout import wrap_python
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +147,6 @@ def embed_mds(D: np.ndarray, random_state: int = 42) -> np.ndarray:
         metric=True,
         dissimilarity="precomputed",
         random_state=random_state,
-        init="random",
         n_init=1,
         max_iter=300,
         normalized_stress=False,
@@ -172,6 +172,21 @@ def embed_torus_mds(
     proj = MDSTorusProjector(projection="robust_wrap")
     X = proj.fit_transform(D, max_iters=max_iters, seed=seed)
     return X, proj.alpha_, proj
+
+
+def embed_wrap_python(
+    G: nx.Graph,
+    D: np.ndarray,
+    max_iters: int = 2000,
+    seed: int = 42,
+) -> np.ndarray:
+    result = wrap_python(
+        G,
+        seed=seed,
+        max_iters=max_iters,
+        shortest_path_lengths=D,
+    )
+    return result.positions
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +308,32 @@ def run_experiment(
         except Exception:
             print(f"[{exp_idx}] s_gd2 failed:\n{traceback.format_exc(limit=2)}")
 
+        # ---- standalone_toruslayout.wrap_python ----
+        try:
+            t0 = time.perf_counter()
+            X_wrap_python = embed_wrap_python(G, D, max_iters=torus_max_iters)
+            t_embed = time.perf_counter() - t0
+            alpha = estimate_alpha(X_wrap_python, D)
+            geod_torus = lambda p, q, a=alpha: a * torus_distance(p, q)
+            metrics = compute_metrics(
+                X_wrap_python,
+                D,
+                geod_torus,
+                max_n=metric_subsample,
+                rg=np_radius,
+            )
+            records.append(
+                {
+                    **base,
+                    "method": "wrap_python",
+                    "t_embed": round(t_embed, 4),
+                    **metrics,
+                    "alpha": round(alpha, 6),
+                }
+            )
+        except Exception:
+            print(f"[{exp_idx}] wrap_python failed:\n{traceback.format_exc(limit=2)}")
+
         # ---- Toroidal MDS ----
         try:
             t0 = time.perf_counter()
@@ -312,7 +353,7 @@ def run_experiment(
 
     df = pd.DataFrame(records)
     df.to_csv(output_csv, index=False)
-    print(f"\nSaved {len(df)} records ({n_graphs} experiments) → {output_csv}")
+    print(f"\nSaved {len(df)} records ({n_graphs} experiments) -> {output_csv}")
     return df
 
 
@@ -324,7 +365,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="GRG embedding comparison: MDS vs s_gd2 vs TorusMDS"
     )
-    parser.add_argument("--n-graphs", type=int, default=1000,
+    parser.add_argument("--n-graphs", type=int, default=300,
                         help="Number of GRG graphs to generate (default: 1000)")
     parser.add_argument("--n-min", type=int, default=100,
                         help="Minimum number of nodes (default: 100)")

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 Experimental comparison: Euclidean MDS vs. MDS by SGD vs. Torus-MDS
-on 1000 stochastic block model graphs.
+on powerlaw-cluster graphs.
 
 Usage:
-    python sbm_comparison.py [--n-graphs N] [--seed S] [--output results/sbm_comparison.csv]
-    python sbm_comparison.py --torus-max-iters 1000 
+    python pcg_comparison.py [--n-graphs N] [--seed S] [--output results/pcg_comparison.csv]
+    python pcg_comparison.py --torus-max-iters 1000
 """
 
 from __future__ import annotations
@@ -43,33 +43,27 @@ from standalone_toruslayout import wrap_python
 # Graph generation
 # ---------------------------------------------------------------------------
 
-def _make_block_probs(k: int, p_in: float, p_out: float) -> list[list[float]]:
-    return [[p_in if i == j else p_out for j in range(k)] for i in range(k)]
-
-
-def generate_sbm(
+def generate_pcg(
     n: int,
-    k: int,
+    m: int,
+    p: float,
     rng: np.random.Generator,
-    p_in: float = 0.3,
-    p_out: float = 0.05,
     max_retries: int = 20,
-) -> tuple[nx.Graph, list[int]]:
-    """Return a connected SBM with k roughly-equal blocks, retrying until connected."""
-    sizes = [n // k] * k
-    sizes[-1] += n - sum(sizes)
-    probs = _make_block_probs(k, p_in, p_out)
+) -> nx.Graph:
+    """Return a connected powerlaw-cluster graph, retrying until connected."""
+    m = max(1, min(m, n - 1))
 
     for _ in range(max_retries):
         seed = int(rng.integers(0, 2**31))
-        G = nx.stochastic_block_model(sizes, probs, seed=seed)
+        G = nx.powerlaw_cluster_graph(n, m, p, seed=seed)
         if nx.is_connected(G):
-            return G, sizes
-    G = nx.stochastic_block_model(sizes, probs, seed=int(rng.integers(0, 2**31)))
+            return G
+
+    G = nx.powerlaw_cluster_graph(n, m, p, seed=int(rng.integers(0, 2**31)))
     comps = list(nx.connected_components(G))
     for i in range(len(comps) - 1):
         G.add_edge(next(iter(comps[i])), next(iter(comps[i + 1])))
-    return G, sizes
+    return G
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +93,6 @@ def embed_mds(D: np.ndarray, random_state: int = 42) -> np.ndarray:
         metric=True,
         dissimilarity="precomputed",
         random_state=random_state,
-        init="random",
         n_init=1,
         max_iter=300,
         normalized_stress=False,
@@ -108,9 +101,7 @@ def embed_mds(D: np.ndarray, random_state: int = 42) -> np.ndarray:
 
 
 def embed_sgd2(G: nx.Graph, random_seed: int = 42) -> np.ndarray:
-    """
-    s_gd2 graph layout. 
-    """
+    """s_gd2 graph layout."""
     nodes = sorted(G.nodes())
     idx = {v: i for i, v in enumerate(nodes)}
     edges = list(G.edges())
@@ -179,21 +170,25 @@ def compute_metrics(
 # ---------------------------------------------------------------------------
 
 def run_experiment(
-    n_graphs: int = 1000,
+    n_graphs: int = 300,
     n_min: int = 100,
     n_max: int = 1000,
-    k_min: int = 3,
-    k_max: int = 8,
+    m_min: int = 2,
+    m_max: int = 8,
+    p_min: float = 0.0,
+    p_max: float = 1.0,
+    n_p: int = 6,
     torus_max_iters: int = 2000,
     metric_subsample: int = 100,
     np_radius: float = 2.0,
-    output_csv: str = "results/sbm_comparison.csv",
+    output_csv: str = "results/pcg_comparison.csv",
     checkpoint_every: int = 50,
     seed: int = 0,
 ) -> pd.DataFrame:
 
     os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
     rng = np.random.default_rng(seed)
+    p_grid = np.linspace(p_min, p_max, n_p).round(3).tolist()
 
     # Resume from checkpoint if CSV already exists
     existing: list[dict] = []
@@ -210,13 +205,15 @@ def run_experiment(
 
     records: list[dict] = list(existing)
 
-    for exp_idx in tqdm(range(start_idx, n_graphs), desc="SBM experiments"):
-        # Sample graph size log-uniformly and block count uniformly
+    for exp_idx in tqdm(range(start_idx, n_graphs), desc="PCG experiments"):
         n = int(np.exp(rng.uniform(np.log(n_min), np.log(n_max))))
-        k = int(rng.integers(k_min, k_max + 1))
+        m = int(rng.integers(m_min, m_max + 1))
+        m = min(m, max(1, n - 1))
+        p = float(rng.choice(p_grid))
 
         try:
-            G, block_sizes = generate_sbm(n, k, rng)
+            G = generate_pcg(n, m, p, rng)
+            G = nx.convert_node_labels_to_integers(G)
         except Exception as e:
             print(f"[{exp_idx}] Graph generation failed: {e}")
             continue
@@ -227,10 +224,14 @@ def run_experiment(
         D = spd_matrix(G)
         t_spd = time.perf_counter() - t0
 
+        clustering = nx.average_clustering(G)
+
         base = dict(
             exp_idx=exp_idx,
             n=n_actual,
-            k=k,
+            m=m,
+            p=round(p, 3),
+            clustering=round(clustering, 6),
             t_spd=round(t_spd, 4),
         )
 
@@ -243,8 +244,9 @@ def run_experiment(
             metrics = compute_metrics(
                 X_mds, D, euc_distance, max_n=metric_subsample, rg=np_radius
             )
-            records.append({**base, "method": "MDS", "t_embed": round(t_embed, 4),
-                             **metrics, "alpha": float("nan")})
+            records.append(
+                {**base, "method": "MDS", "t_embed": round(t_embed, 4), **metrics, "alpha": float("nan")}
+            )
         except Exception:
             print(f"[{exp_idx}] MDS failed:\n{traceback.format_exc(limit=2)}")
 
@@ -257,8 +259,9 @@ def run_experiment(
             metrics = compute_metrics(
                 X_sgd2, D, euc_distance, max_n=metric_subsample, rg=np_radius
             )
-            records.append({**base, "method": "s_gd2", "t_embed": round(t_embed, 4),
-                             **metrics, "alpha": float("nan")})
+            records.append(
+                {**base, "method": "s_gd2", "t_embed": round(t_embed, 4), **metrics, "alpha": float("nan")}
+            )
         except Exception:
             print(f"[{exp_idx}] s_gd2 failed:\n{traceback.format_exc(limit=2)}")
 
@@ -269,7 +272,7 @@ def run_experiment(
             t_embed = time.perf_counter() - t0
 
             alpha = estimate_alpha(X_wrap_python, D)
-            geod_torus = lambda p, q, a=alpha: a * torus_distance(p, q)
+            geod_torus = lambda p1, p2, a=alpha: a * torus_distance(p1, p2)
 
             metrics = compute_metrics(
                 X_wrap_python, D, geod_torus, max_n=metric_subsample, rg=np_radius
@@ -292,19 +295,24 @@ def run_experiment(
             X_torus, alpha_fit, _ = embed_torus_mds(D, max_iters=torus_max_iters)
             t_embed = time.perf_counter() - t0
 
-            # Re-estimate scale on the projected embedding for accurate metric evaluation
             alpha = estimate_alpha(X_torus, D)
-            geod_torus = lambda p, q, a=alpha: a * torus_distance(p, q)
+            geod_torus = lambda p1, p2, a=alpha: a * torus_distance(p1, p2)
 
             metrics = compute_metrics(
                 X_torus, D, geod_torus, max_n=metric_subsample, rg=np_radius
             )
-            records.append({**base, "method": "TorusMDS", "t_embed": round(t_embed, 4),
-                             **metrics, "alpha": round(alpha, 6)})
+            records.append(
+                {
+                    **base,
+                    "method": "TorusMDS",
+                    "t_embed": round(t_embed, 4),
+                    **metrics,
+                    "alpha": round(alpha, 6),
+                }
+            )
         except Exception:
             print(f"[{exp_idx}] TorusMDS failed:\n{traceback.format_exc(limit=2)}")
 
-        # Checkpoint
         if (exp_idx + 1) % checkpoint_every == 0:
             pd.DataFrame(records).to_csv(output_csv, index=False)
 
@@ -320,26 +328,32 @@ def run_experiment(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SBM embedding comparison: MDS vs s_gd2 vs TorusMDS"
+        description="PCG embedding comparison: MDS vs s_gd2 vs wrap_python vs TorusMDS"
     )
     parser.add_argument("--n-graphs", type=int, default=300,
-                        help="Number of SBM graphs to generate (default: 1000)")
+                        help="Number of powerlaw-cluster graphs to generate (default: 300)")
     parser.add_argument("--n-min", type=int, default=100,
                         help="Minimum number of nodes (default: 100)")
     parser.add_argument("--n-max", type=int, default=1000,
                         help="Maximum number of nodes (default: 1000)")
-    parser.add_argument("--k-min", type=int, default=3,
-                        help="Minimum number of SBM blocks (default: 3)")
-    parser.add_argument("--k-max", type=int, default=8,
-                        help="Maximum number of SBM blocks (default: 8)")
+    parser.add_argument("--m-min", type=int, default=2,
+                        help="Minimum attachment parameter m (default: 2)")
+    parser.add_argument("--m-max", type=int, default=8,
+                        help="Maximum attachment parameter m (default: 8)")
+    parser.add_argument("--p-min", type=float, default=0.0,
+                        help="Minimum triangle probability p (default: 0.0)")
+    parser.add_argument("--p-max", type=float, default=1.0,
+                        help="Maximum triangle probability p (default: 1.0)")
+    parser.add_argument("--n-p", type=int, default=6,
+                        help="Number of discrete p values in the sampling grid (default: 6)")
     parser.add_argument("--torus-max-iters", type=int, default=2000,
-                        help="SGD iterations for TorusMDS (default: 2000)")
+                        help="SGD iterations for TorusMDS/wrap_python (default: 2000)")
     parser.add_argument("--metric-subsample", type=int, default=100,
                         help="Max nodes used for metric computation (default: 100)")
     parser.add_argument("--np-radius", type=float, default=2.0,
                         help="Graph-distance radius for neighbourhood preservation (default: 2.0)")
-    parser.add_argument("--output", type=str, default="results/sbm_comparison.csv",
-                        help="Output CSV path (default: results/sbm_comparison.csv)")
+    parser.add_argument("--output", type=str, default="results/pcg_comparison.csv",
+                        help="Output CSV path (default: results/pcg_comparison.csv)")
     parser.add_argument("--checkpoint-every", type=int, default=50,
                         help="Save CSV every N experiments (default: 50)")
     parser.add_argument("--seed", type=int, default=0,
@@ -350,8 +364,11 @@ if __name__ == "__main__":
         n_graphs=args.n_graphs,
         n_min=args.n_min,
         n_max=args.n_max,
-        k_min=args.k_min,
-        k_max=args.k_max,
+        m_min=args.m_min,
+        m_max=args.m_max,
+        p_min=args.p_min,
+        p_max=args.p_max,
+        n_p=args.n_p,
         torus_max_iters=args.torus_max_iters,
         metric_subsample=args.metric_subsample,
         np_radius=args.np_radius,
