@@ -330,7 +330,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="PCG embedding comparison: MDS vs s_gd2 vs wrap_python vs TorusMDS"
     )
-    parser.add_argument("--n-graphs", type=int, default=300,
+    parser.add_argument("--n-graphs", type=int, default=1000,
                         help="Number of powerlaw-cluster graphs to generate (default: 300)")
     parser.add_argument("--n-min", type=int, default=100,
                         help="Minimum number of nodes (default: 100)")

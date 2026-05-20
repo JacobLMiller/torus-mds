@@ -322,7 +322,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="SBM embedding comparison: MDS vs s_gd2 vs TorusMDS"
     )
-    parser.add_argument("--n-graphs", type=int, default=300,
+    parser.add_argument("--n-graphs", type=int, default=1000,
                         help="Number of SBM graphs to generate (default: 1000)")
     parser.add_argument("--n-min", type=int, default=100,
                         help="Minimum number of nodes (default: 100)")
