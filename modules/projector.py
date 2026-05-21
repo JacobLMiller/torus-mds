@@ -391,6 +391,7 @@ class TorusProjector:
 
 @dataclass
 class MDSTorusProjector(TorusProjector):
+    projection: Literal["wrap", "robust_wrap"] = "wrap"
 
     learning_rate = 1
 

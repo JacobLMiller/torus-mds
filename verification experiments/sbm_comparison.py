@@ -124,7 +124,7 @@ def embed_torus_mds(
     max_iters: int = 2000,
     seed: int = 42,
 ) -> tuple[np.ndarray, float, MDSTorusProjector]:
-    proj = MDSTorusProjector(projection="robust_wrap")
+    proj = MDSTorusProjector(projection="wrap")
     X = proj.fit_transform(D, max_iters=max_iters, seed=seed)
     return X, proj.alpha_, proj
 
