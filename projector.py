@@ -10,8 +10,8 @@ from modules.projector import (
     _wrap_unit_square,
 )
 from modules.geometry import (
-    torus_distance_njit as torus,
     torus_distance,
+    make_torus_geod,
     torus_grad,
     euclidean_grad,
     stress_and_grad_rect_torus,

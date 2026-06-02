@@ -1,6 +1,6 @@
 from .geometry import (
-    torus_distance_njit,
     torus_distance,
+    make_torus_geod,
     torus_grad,
     euclidean_grad,
     stress_and_grad_rect_torus,

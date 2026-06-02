@@ -411,10 +411,10 @@ class MDSTorusProjector(TorusProjector):
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
+        if theta != 90.0 and not np.isclose(r0_init, r1_init):
+            raise ValueError("theta != 90 requires equal side lengths: set r0_init == r1_init or use theta=90 for a rectangular torus")
         if theta != 90.0 and learn_mode in ('rectangular', 'alpha_aspect'):
-            raise ValueError(
-                "theta != 90 requires equal side lengths; use learn_mode='alpha' or 'square'"
-            )
+            raise ValueError("theta != 90 requires equal side lengths; use learn_mode='fixed', 'alpha', or 'square'")
         theta_rad = float(np.radians(theta))
         mode_int = {'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3, 'alpha_aspect': 4}[learn_mode]
 

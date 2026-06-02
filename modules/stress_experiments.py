@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from . import graphio, metrics, visualization
-from .geometry import euclidean_grad, stress_and_grad_rect_torus
+from .geometry import euclidean_grad, make_torus_geod, stress_and_grad_rect_torus
 from .projector import sgd_minibatch_njit
 
 
@@ -60,7 +60,7 @@ class EmbeddingRun:
         return self.coords
 
     def geod(self) -> Callable[[np.ndarray, np.ndarray], float]:
-        return make_rect_torus_geod(self.alpha_, self.r0_, self.r1_, self.theta_)
+        return make_torus_geod(self.alpha_, self.r0_, self.r1_, self.theta_)
 
 
 VARIANTS: tuple[OptimizerVariant, ...] = (
@@ -442,38 +442,6 @@ def build_diverse_control_benchmarks(*, seed: int = 0) -> list[BenchmarkSpec]:
         )
 
     return specs
-
-
-def rect_torus_distance(
-    p1: np.ndarray,
-    p2: np.ndarray,
-    *,
-    alpha: float = 1.0,
-    r0: float = 1.0,
-    r1: float = 1.0,
-    theta: float = np.pi / 2,
-) -> float:
-    cos_theta = float(np.cos(theta))
-    du = p2 - p1
-    a = (du[0] + 0.5) - np.floor(du[0] + 0.5) - 0.5
-    b = (du[1] + 0.5) - np.floor(du[1] + 0.5) - 0.5
-    a1 = a - 1.0 if a >= 0.0 else a + 1.0
-    b1 = b - 1.0 if b >= 0.0 else b + 1.0
-
-    q_best = a * a + 2.0 * cos_theta * a * b + b * b
-    du0 = a
-    du1 = b
-    for u, v in ((a1, b), (a, b1), (a1, b1)):
-        q = u * u + 2.0 * cos_theta * u * v + v * v
-        if q < q_best:
-            q_best = q
-            du0 = u
-            du1 = v
-    return alpha * math.sqrt((r0 * du0) ** 2 + (r1 * du1) ** 2)
-
-
-def make_rect_torus_geod(alpha: float, r0: float, r1: float, theta: float) -> Callable[[np.ndarray, np.ndarray], float]:
-    return lambda p, q: rect_torus_distance(p, q, alpha=alpha, r0=r0, r1=r1, theta=theta)
 
 
 def euclidean_distance(
@@ -1652,7 +1620,7 @@ def benchmark_variants(
                     theta=theta,
                 )
                 runtime_s = time.perf_counter() - started
-                geod = make_rect_torus_geod(alpha, r0, r1, theta)
+                geod = make_torus_geod(alpha, r0, r1, theta)
                 stress = metrics.geodesic_stress(coords, spec.distances, geod)
                 distortion = metrics.geodesic_distortion(coords, spec.distances, geod)
 
@@ -1764,7 +1732,7 @@ def benchmark_objective_controls(
                             learn_mode="alpha",
                             theta=theta,
                         )
-                        geod = make_rect_torus_geod(alpha, r0, r1, theta)
+                        geod = make_torus_geod(alpha, r0, r1, theta)
                     else:
                         coords, alpha, pair_evals, epochs = run_optimizer_variant_euclidean_control(
                             spec.distances,

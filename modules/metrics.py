@@ -94,20 +94,37 @@ def geodesic_NP(X: np.ndarray, D: np.ndarray, geod, rg: float = 2) -> float:
     return float(score / count) if count > 0 else 0.0
 
 
-def estimate_alpha(X: np.ndarray, D: np.ndarray) -> float:
+def estimate_alpha(
+    X: np.ndarray,
+    D: np.ndarray,
+    geod=None,
+    *,
+    r0: float = 1.0,
+    r1: float = 1.0,
+    theta: float = np.pi / 2,
+) -> float:
     """
-    Closed-form least-squares estimate of the torus scale factor alpha for a
-    fixed layout X and target distances D:
+    Closed-form least-squares estimate of the torus scale factor alpha for a fixed layout X and target distances D.
 
-        alpha_hat = sum(D_ij * r_ij) / sum(r_ij^2),  r_ij = torus_distance(X[i], X[j])
+    By default this is the old unit-square torus behavior.
+    For rectangular/rhombic tori, either pass an unscaled `geod`, or pass r0, r1, and theta:
 
-    Used for evaluating external layouts.
+        estimate_alpha(X, D, r0=proj.r0_, r1=proj.r1_, theta=proj.theta_)
+
+    The fitted scale is:
+
+        alpha_hat = sum(D_ij * r_ij) / sum(r_ij^2)
+
+    where `geod` returns the unscaled base distance r_ij.
     """
+    if geod is None:
+        geod = lambda p, q: torus_distance(p, q, r0=r0, r1=r1, theta=theta)
+
     n = X.shape[0]
     num, denom = 0.0, 0.0
     for i in range(n):
         for j in range(i):
-            r = torus_distance(X[i], X[j])
+            r = geod(X[i], X[j])
             num   += D[i, j] * r
             denom += r * r
     return float(num / denom)
