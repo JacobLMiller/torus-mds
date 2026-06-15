@@ -7,7 +7,14 @@ import numpy as np
 import numba
 from numba.typed import List as NumbaList
 
-from .geometry import grad_rect_torus, torus_grad
+from .geometry import (
+    grad_rect_torus,
+    grad_parallelogram_torus,
+    _gauss_reduce_njit,
+    lengths_angle_to_xy,
+    xy_to_lengths_angle,
+    torus_grad,
+)
 
 DEFAULT_SEQUENCE_CHUNK_EPOCHS = 128
 
@@ -62,6 +69,80 @@ def _build_sampled_unique_pair_sequence_from_pairs(
 
 
 @numba.njit(cache=True, fastmath=True)
+def _update_parallelogram_geom(
+    params, learn_mode, num, den, gx_sum, gy_sum, used,
+    alpha, x, y, y_raw, alpha_ema, alpha_min, alpha_max, geom_lr, eps,
+):
+    """
+    One batch geometry update for the parallelogram learn modes (alpha, x, y).
+
+    learn_mode == 5 ('rhombic'):       equal sides, y = sqrt(1 - x^2); learn the
+        angle via x (clamped to [-1/2, 1/2], i.e. angle in [60, 120] deg). Always
+        Gauss-reduced, so no tidy is needed.
+    learn_mode == 6 ('parallelogram'): free shape via (x, y_raw) with
+        y = sqrt(1 - x^2) + softplus(y_raw); a tidy step Gauss-reduces and shears
+        the positions whenever |x| > 1/2.
+
+    alpha is the closed-form least-squares scale (EMA-smoothed). Returns the
+    updated (alpha, x, y, y_raw); params may be sheared in place by the tidy.
+    """
+    alpha_hat = num / (den + eps)
+    alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
+    alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
+
+    base = np.sqrt(max(0.0, 1.0 - x * x))
+    inv_base = x / base if base > 1e-9 else 0.0  # d(sqrt(1-x^2))/dx = -x/base
+
+    if learn_mode == 5:
+        # dL/dx = gx + gy * d y / d x,  with y = sqrt(1 - x^2)
+        dx = gx_sum - gy_sum * inv_base
+        x = x - geom_lr * dx / used
+        if x < -0.5:
+            x = -0.5
+        elif x > 0.5:
+            x = 0.5
+        y = np.sqrt(max(0.0, 1.0 - x * x))
+    else:
+        sig = 1.0 / (1.0 + np.exp(-y_raw))  # d softplus / d y_raw
+        dx = gx_sum - gy_sum * inv_base
+        dyr = gy_sum * sig
+        x = x - geom_lr * dx / used
+        y_raw = y_raw - geom_lr * dyr / used
+        base = np.sqrt(max(0.0, 1.0 - x * x))
+        # stable softplus = log(1 + exp(y_raw)) (numba lacks np.logaddexp)
+        softplus = max(y_raw, 0.0) + np.log1p(np.exp(-abs(y_raw)))
+        y = base + softplus
+
+        if abs(x) > 0.5:  # tidy: reduce, shear positions, fold scale, translate back
+            xr, yr, scale, u00, u01, u10, u11 = _gauss_reduce_njit(x, y)
+            for p in range(params.shape[0]):
+                s0 = params[p, 0]
+                s1 = params[p, 1]
+                params[p, 0] = (u00 * s0 + u01 * s1) % 1.0
+                params[p, 1] = (u10 * s0 + u11 * s1) % 1.0
+            alpha = alpha * scale
+            x = xr
+            y = yr
+            base = np.sqrt(max(0.0, 1.0 - x * x))
+            spv = y - base
+            if spv < 1e-12:
+                spv = 1e-12
+            y_raw = np.log(np.expm1(spv))
+
+    return alpha, x, y, y_raw
+
+
+@numba.njit(cache=True, fastmath=True)
+def _init_parallelogram_yraw(x, y):
+    """Inverse-softplus initialization of y_raw so sqrt(1-x^2)+softplus(y_raw)==y."""
+    base = np.sqrt(max(0.0, 1.0 - x * x))
+    spv = y - base
+    if spv < 1e-12:
+        spv = 1e-12
+    return np.log(np.expm1(spv))
+
+
+@numba.njit(cache=True, fastmath=True)
 def _sgd_minibatch_njit_legacy(
     data,
     learning_rate,
@@ -75,20 +156,26 @@ def _sgd_minibatch_njit_legacy(
     alpha_max=1e6,
     r0_init=1.0,
     r1_init=1.0,
-    learn_mode=0,   # 0=fixed, 1=alpha, 2=square, 3=rectangular, 4=alpha_aspect
+    learn_mode=0,   # 0=fixed,1=alpha,2=square,3=rectangular,4=alpha_aspect,5=rhombic,6=parallelogram
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
+    x_init=0.0,
+    y_init=1.0,
 ):
     """
-    Minibatch SGD for torus MDS on a flat rectangular/rhombic torus.
+    Minibatch SGD for torus MDS on a flat parallelogram torus.
 
-    learn_mode=0 ('fixed'):    positions only; alpha, r0, r1 fixed.
-    learn_mode=1 ('alpha'):    positions + alpha via closed-form batch minimiser + EMA.
-    learn_mode=2 ('square'):   positions + shared r = r0 = r1 via SGD; alpha fixed.
+    learn_mode=0 ('fixed'):       positions only; geometry fixed.
+    learn_mode=1 ('alpha'):       positions + alpha via closed-form minimiser + EMA.
+    learn_mode=2 ('square'):      positions + shared r = r0 = r1 via SGD; alpha fixed.
     learn_mode=3 ('rectangular'): positions + independent r0, r1 via SGD; alpha fixed.
+    learn_mode=4 ('alpha_aspect'): positions + alpha + log-aspect.
+    learn_mode=5 ('rhombic'):     positions + alpha + rhombus angle (shear x), equal sides.
+    learn_mode=6 ('parallelogram'): positions + alpha + free shear x and height y.
 
-    Returns: (params, alpha, r0, r1)
+    Modes 5/6 use the (alpha, x, y) parametrization (x_init, y_init); modes 0-4 use
+    (r0_init, r1_init, theta). Returns: (params, alpha, r0, r1, x, y).
     """
     n = data.shape[0]
     np.random.seed(seed)
@@ -97,6 +184,9 @@ def _sgd_minibatch_njit_legacy(
     alpha = alpha_init
     r0 = r0_init
     r1 = r1_init
+    x = x_init
+    y = y_init
+    y_raw = _init_parallelogram_yraw(x, y) if learn_mode == 6 else 0.0
     if learn_mode == 4:
         aspect_scale = np.sqrt(max(geom_min, r0 * r1))
         alpha *= aspect_scale
@@ -120,6 +210,8 @@ def _sgd_minibatch_njit_legacy(
         den = 0.0
         gr0_sum = 0.0
         gr1_sum = 0.0
+        gx_sum = 0.0
+        gy_sum = 0.0
         used = 0
         drawn = 0
 
@@ -130,9 +222,18 @@ def _sgd_minibatch_njit_legacy(
                 continue
 
             d = data[i, j]
-            g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
-                params[i], params[j], d, alpha, r0, r1, eps, theta
-            )
+            if learn_mode >= 5:
+                g0, g1, dist, ga, gb = grad_parallelogram_torus(
+                    params[i], params[j], d, alpha, x, y, eps
+                )
+                gx_sum += ga
+                gy_sum += gb
+            else:
+                g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
+                    params[i], params[j], d, alpha, r0, r1, eps, theta
+                )
+                gr0_sum += gr0_k
+                gr1_sum += gr1_k
 
             params[i, 0] -= step_pos * g0
             params[i, 1] -= step_pos * g1
@@ -141,8 +242,6 @@ def _sgd_minibatch_njit_legacy(
 
             num += d * dist
             den += dist * dist
-            gr0_sum += gr0_k
-            gr1_sum += gr1_k
             used += 1
             drawn += 1
 
@@ -172,8 +271,13 @@ def _sgd_minibatch_njit_legacy(
                     log_aspect = 6.0
                 r0 = np.exp(-0.5 * log_aspect)
                 r1 = np.exp(0.5 * log_aspect)
+            elif learn_mode >= 5:
+                alpha, x, y, y_raw = _update_parallelogram_geom(
+                    params, learn_mode, num, den, gx_sum, gy_sum, used,
+                    alpha, x, y, y_raw, alpha_ema, alpha_min, alpha_max, geom_lr, eps,
+                )
 
-    return params, alpha, r0, r1
+    return params, alpha, r0, r1, x, y
 
 
 @numba.njit(cache=True, fastmath=True)
@@ -190,15 +294,20 @@ def _run_pair_sequence_online_njit(
     alpha_max=1e6,
     r0_init=1.0,
     r1_init=1.0,
-    learn_mode=0,   # 0=fixed, 1=alpha, 2=square, 3=rectangular, 4=alpha_aspect
+    learn_mode=0,   # 0=fixed,1=alpha,2=square,3=rectangular,4=alpha_aspect,5=rhombic,6=parallelogram
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
+    x_init=0.0,
+    y_init=1.0,
 ):
     params = init_params.copy()
     alpha = alpha_init
     r0 = r0_init
     r1 = r1_init
+    x = x_init
+    y = y_init
+    y_raw = _init_parallelogram_yraw(x, y) if learn_mode == 6 else 0.0
     if learn_mode == 4:
         aspect_scale = np.sqrt(max(geom_min, r0 * r1))
         alpha *= aspect_scale
@@ -226,14 +335,25 @@ def _run_pair_sequence_online_njit(
         den = 0.0
         gr0_sum = 0.0
         gr1_sum = 0.0
+        gx_sum = 0.0
+        gy_sum = 0.0
         for k in range(used):
             i = seq[k, 0]
             j = seq[k, 1]
 
             d = data[i, j]
-            g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
-                params[i], params[j], d, alpha, r0, r1, eps, theta
-            )
+            if learn_mode >= 5:
+                g0, g1, dist, ga, gb = grad_parallelogram_torus(
+                    params[i], params[j], d, alpha, x, y, eps
+                )
+                gx_sum += ga
+                gy_sum += gb
+            else:
+                g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
+                    params[i], params[j], d, alpha, r0, r1, eps, theta
+                )
+                gr0_sum += gr0_k
+                gr1_sum += gr1_k
 
             params[i, 0] -= step_pos * g0
             params[i, 1] -= step_pos * g1
@@ -242,8 +362,6 @@ def _run_pair_sequence_online_njit(
 
             num += d * dist
             den += dist * dist
-            gr0_sum += gr0_k
-            gr1_sum += gr1_k
 
         params %= 1.0
 
@@ -271,8 +389,13 @@ def _run_pair_sequence_online_njit(
                     log_aspect = 6.0
                 r0 = np.exp(-0.5 * log_aspect)
                 r1 = np.exp(0.5 * log_aspect)
+            elif learn_mode >= 5:
+                alpha, x, y, y_raw = _update_parallelogram_geom(
+                    params, learn_mode, num, den, gx_sum, gy_sum, used,
+                    alpha, x, y, y_raw, alpha_ema, alpha_min, alpha_max, geom_lr, eps,
+                )
 
-    return params, alpha, r0, r1
+    return params, alpha, r0, r1, x, y
 
 
 def sgd_minibatch_njit(
@@ -288,10 +411,12 @@ def sgd_minibatch_njit(
     alpha_max=1e6,
     r0_init=1.0,
     r1_init=1.0,
-    learn_mode=0,   # 0=fixed, 1=alpha, 2=square, 3=rectangular, 4=alpha_aspect
+    learn_mode=0,   # 0=fixed,1=alpha,2=square,3=rectangular,4=alpha_aspect,5=rhombic,6=parallelogram
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
+    x_init=0.0,
+    y_init=1.0,
     chunk_epochs=DEFAULT_SEQUENCE_CHUNK_EPOCHS,
 ):
     """
@@ -299,7 +424,7 @@ def sgd_minibatch_njit(
 
     This replaces the older with-replacement pair sampling
 
-    Returns: (params, alpha, r0, r1)
+    Returns: (params, alpha, r0, r1, x, y)
     """
     data = np.asarray(data, dtype=np.float64)
     n = data.shape[0]
@@ -307,8 +432,10 @@ def sgd_minibatch_njit(
     alpha = float(alpha_init)
     r0 = float(r0_init)
     r1 = float(r1_init)
+    x = float(x_init)
+    y = float(y_init)
     if max_iters <= 0 or n < 2:
-        return params, alpha, r0, r1
+        return params, alpha, r0, r1, x, y
 
     rng = np.random.default_rng(seed)
     pairs = _all_unique_pairs(n)
@@ -316,7 +443,7 @@ def sgd_minibatch_njit(
     while start_iter < max_iters:
         epochs = min(chunk_epochs, max_iters - start_iter)
         sequence = _build_sampled_unique_pair_sequence_from_pairs(pairs, rng, epochs, batch_pairs)
-        params, alpha, r0, r1 = _run_pair_sequence_online_njit(
+        params, alpha, r0, r1, x, y = _run_pair_sequence_online_njit(
             data=data,
             pair_sequence=sequence,
             learning_rate=learning_rate,
@@ -333,9 +460,11 @@ def sgd_minibatch_njit(
             geom_lr=geom_lr,
             geom_min=geom_min,
             theta=theta,
+            x_init=x,
+            y_init=y,
         )
         start_iter += epochs
-    return params, alpha, r0, r1
+    return params, alpha, r0, r1, x, y
 
 
 @dataclass
@@ -404,26 +533,57 @@ class MDSTorusProjector(TorusProjector):
             alpha_init=1.0,
             r0_init=1.0,
             r1_init=1.0,
-            learn_mode='alpha',   # 'fixed' | 'alpha' | 'square' | 'rectangular' | 'alpha_aspect'
+            learn_mode='alpha',   # 'fixed'|'alpha'|'square'|'rectangular'|'alpha_aspect'|'rhombic'|'parallelogram'
             geom_lr=0.01,
             sampled_unique=True,
             theta=90.0,           # torus angle in degrees; must be in [60, 120]
+            x_init=None,          # initial shear (parallelogram/rhombic); default derived from theta
+            y_init=None,          # initial height (parallelogram)
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
-        if theta != 90.0 and not np.isclose(r0_init, r1_init):
-            raise ValueError("theta != 90 requires equal side lengths: set r0_init == r1_init or use theta=90 for a rectangular torus")
-        if theta != 90.0 and learn_mode in ('rectangular', 'alpha_aspect'):
-            raise ValueError("theta != 90 requires equal side lengths; use learn_mode='fixed', 'alpha', or 'square'")
+        mode_int = {
+            'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3,
+            'alpha_aspect': 4, 'rhombic': 5, 'parallelogram': 6,
+        }[learn_mode]
+
+        # Modes 0-4 use the rect kernel, exact only for rectangular or equal-side
+        # rhombic bases. At theta != 90, 'fixed' and 'alpha' are fine as a fixed-angle
+        # rhombic torus (equal sides required); 'square'/'rectangular'/'alpha_aspect'
+        # contradict a non-rectangular rhombus and are redirected to the dedicated
+        # parallelogram modes (5, 6).
+        if theta != 90.0:
+            if mode_int in (2, 3, 4):
+                raise ValueError(
+                    f"learn_mode={learn_mode!r} does not support theta != 90 "
+                    "(non-rectangular). Use learn_mode='rhombic' to learn the angle, "
+                    "'parallelogram' for a general shape, or 'alpha'/'fixed' with "
+                    "r0_init == r1_init for a fixed-angle rhombic torus."
+                )
+            if mode_int in (0, 1) and not np.isclose(r0_init, r1_init):
+                raise ValueError(
+                    "theta != 90 with learn_mode='fixed'/'alpha' requires equal side "
+                    "lengths (set r0_init == r1_init) for an exact rhombic torus."
+                )
         theta_rad = float(np.radians(theta))
-        mode_int = {'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3, 'alpha_aspect': 4}[learn_mode]
+
+        # Initial shear/height for the parallelogram modes (5, 6).
+        if x_init is None or y_init is None:
+            _, x0, y0 = lengths_angle_to_xy(r0_init, r1_init, theta_rad)
+        else:
+            x0, y0 = float(x_init), float(y_init)
+        if mode_int == 5:
+            # rhombic: start on the unit circle (equal sides) at the given angle
+            x0, y0 = float(np.cos(theta_rad)), float(np.sin(theta_rad))
+        if mode_int == 6 and x_init is None and abs(x0) < 1e-6:
+            x0 = 0.05  # asymmetric init to escape the x -> -x (rectangular) saddle
 
         if sampled_unique:
             sgd_fn = sgd_minibatch_njit # sample pairs without replacement
         else:
             sgd_fn = _sgd_minibatch_njit_legacy # sample pairs with replacement
 
-        coords, alpha, r0, r1 = sgd_fn(
+        coords, alpha, r0, r1, x, y = sgd_fn(
             data=data,
             learning_rate=self.learning_rate,
             max_iters=max_iters,
@@ -435,11 +595,22 @@ class MDSTorusProjector(TorusProjector):
             learn_mode=mode_int,
             geom_lr=geom_lr,
             theta=theta_rad,
+            x_init=x0,
+            y_init=y0,
         )
+
         self.alpha_ = float(alpha)
-        self.r0_ = float(r0)
-        self.r1_ = float(r1)
-        self.theta_ = theta_rad
+        if mode_int >= 5:
+            # Report learned (alpha, x, y) as side lengths + angle; the b0 length
+            # lives in alpha_, so r0_ = 1 and r1_ = |b1| / |b0|.
+            self.x_ = float(x)
+            self.y_ = float(y)
+            self.r0_, self.r1_, self.theta_ = xy_to_lengths_angle(1.0, x, y)
+        else:
+            self.r0_ = float(r0)
+            self.r1_ = float(r1)
+            self.theta_ = theta_rad
+            _, self.x_, self.y_ = lengths_angle_to_xy(r0, r1, theta_rad)
         return coords
 
     def _embed(self, D: np.ndarray, **kwargs) -> np.ndarray:
