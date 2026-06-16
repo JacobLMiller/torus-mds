@@ -13,6 +13,7 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
                                    s=10, node_alpha=0.9,
                                    edge_alpha=0.10, edge_lw=0.4,
                                    colors=None,
+                                   order=None,
                                    torus=None,
                                    ax=None):
     """
@@ -35,6 +36,11 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
             raise ValueError("Provide either X or a fitted torus object with torus_embedding_.")
         X = torus.torus_embedding_
 
+    if order is not None:
+        X = X[order]
+        if colors is not None:
+            colors = colors[order]
+
     X = np.asarray(X, dtype=np.float64) % 1.0
     idx = {n: i for i, n in enumerate(G.nodes())} if G is not None else {}
 
@@ -51,7 +57,6 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
 
     if ax is None:
         fig, ax = plt.subplots()
-
     # edges — segments computed in [0,1)^2, then mapped to physical space
     for u, v in (G.edges() if G is not None else []):
         i, j = idx[u], idx[v]
@@ -61,7 +66,6 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
             b_phys = M @ b
             ax.plot([a_phys[0], b_phys[0]], [a_phys[1], b_phys[1]],
                      color="k", alpha=edge_alpha, lw=edge_lw, zorder=1)
-
     # points
     X_phys = X @ M.T
     ax.scatter(X_phys[:, 0], X_phys[:, 1], s=s, alpha=node_alpha, zorder=2,
@@ -74,7 +78,6 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
 
     ax.set_aspect('equal', adjustable='datalim')
     ax.axis('off')
-
     # --- Tick marks with physical-unit labels on parallelogram edges ---
     n_ticks   = 5
     tick_ts   = np.linspace(0, 1, n_ticks)
@@ -105,7 +108,6 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
             ax.text(lbl_pos[0], lbl_pos[1], f"{t * r1:.3g}",
                     ha='center', va='center', rotation=np.degrees(theta),
                     fontsize=8, color='dimgray')
-
     plt.tight_layout()
     return ax
 
