@@ -76,7 +76,7 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
     ax.add_patch(MplPolygon(corners, closed=True, fill=False,
                             edgecolor='gray', lw=1, zorder=3))
 
-    ax.set_aspect('equal', adjustable='datalim')
+    ax.set_aspect('equal', adjustable='box')
     ax.axis('off')
     # --- Tick marks with physical-unit labels on parallelogram edges ---
     n_ticks   = 5
@@ -108,7 +108,6 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
             ax.text(lbl_pos[0], lbl_pos[1], f"{t * r1:.3g}",
                     ha='center', va='center', rotation=np.degrees(theta),
                     fontsize=8, color='dimgray')
-    plt.tight_layout()
     return ax
 
 
