@@ -14,10 +14,11 @@ def torus_distance(p1, p2, r0=1.0, r1=1.0, theta=np.pi / 2):
     The 4-candidate image search is exact for the supported cases used by the projector:
     rectangular tori, or equal-side rhombic tori with theta in [pi/3, 2*pi/3].
     For arbitrary parallelograms use ``parallelogram_distance``.
+    Note that rectangular tori do not need for candidates, but have a closed form.
     """
-    if theta != 90.0 and not np.isclose(r0, r1):
+    if not np.isclose(theta, np.pi / 2) and not np.isclose(r0, r1):
         raise ValueError(
-            "theta != pi/2 requires equal side lengths: set r0 == r1 "
+            f"theta != pi/2  (theta={theta}) requires equal side lengths: set r0 == r1 "
             "or use theta=pi/2 for a rectangular torus"
         )
 
