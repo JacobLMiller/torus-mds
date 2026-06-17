@@ -3,62 +3,169 @@ from __future__ import annotations
 import numpy as np
 import numba
 
-def torus_distance(p1, p2, r0=1.0, r1=1.0, theta=np.pi / 2):
+
+# ---------------------------------------------------------------------------
+# Shared min-image primitives.
+#
+# Every flat-torus distance/gradient here reduces to the same problem: given a
+# displacement wrapped to [-1/2, 1/2)^2 and a Gram metric [[g00, g01], [g01, g11]],
+# find the closest lattice image and its squared length. The min-image math has
+# only two regimes -- orthogonal (g01 == 0, closed form) and non-orthogonal
+# (4-candidate search) -- so the wrapping, candidate search, quadratic form and
+# position gradient are factored out here and reused by all three parametrizations
+# (rect, rhombic, parallelogram), which differ only in how they build the Gram and
+# in their shape gradient.
+# ---------------------------------------------------------------------------
+
+@numba.njit(fastmath=True, cache=True)
+def _wrap_to_half(t):
+    """Wrap a torus displacement coordinate to [-1/2, 1/2)."""
+    return ((t + 0.5) % 1.0) - 0.5
+
+
+@numba.njit(fastmath=True, cache=True)
+def _gram_quad(u, v, g00, g01, g11):
+    """Squared length of (u, v) under the Gram metric [[g00, g01], [g01, g11]]."""
+    return g00 * u * u + 2.0 * g01 * u * v + g11 * v * v
+
+
+@numba.njit(fastmath=True, cache=True)
+def _min_image_offset(a, b, g00, g01, g11):
     """
-    Legacy shortest 2D flat-torus distance under a rectangular/rhombic fundamental
-    domain.
+    Closest-image lattice offset for a displacement already wrapped to
+    (a, b) in [-1/2, 1/2)^2, under the Gram metric [[g00, g01], [g01, g11]].
 
-    Parameters are side lengths r0, r1 and angle theta between sides.
-    The default is the unit square torus.
-
-    The 4-candidate image search is exact for the supported cases used by the projector:
-    rectangular tori, or equal-side rhombic tori with theta in [pi/3, 2*pi/3].
-    For arbitrary parallelograms use ``parallelogram_distance``.
-    Note that rectangular tori do not need for candidates, but have a closed form.
+    g01 == 0 (orthogonal basis): the metric is separable, so the per-coordinate
+    wrap (a, b) is the exact closest image -- closed form, no candidate search.
+    Otherwise a 4-candidate search over {a, a-/+1} x {b, b-/+1} is used, which is
+    exact for a Gauss-reduced basis (|x| <= 1/2, x^2 + y^2 >= 1) or an equal-side
+    rhombus (theta in [pi/3, 2*pi/3]). Returns the selected offset (du0, du1).
     """
-    if not np.isclose(theta, np.pi / 2) and not np.isclose(r0, r1):
-        raise ValueError(
-            f"theta != pi/2  (theta={theta}) requires equal side lengths: set r0 == r1 "
-            "or use theta=pi/2 for a rectangular torus"
-        )
-
-    p1 = np.asarray(p1, dtype=np.float64)
-    p2 = np.asarray(p2, dtype=np.float64)
-    cos_theta = np.cos(theta)
-    du = p2 - p1
-    a = (du[0] + 0.5) - np.floor(du[0] + 0.5) - 0.5
-    b = (du[1] + 0.5) - np.floor(du[1] + 0.5) - 0.5
+    if g01 == 0.0:
+        return a, b
     a1 = a - 1.0 if a >= 0.0 else a + 1.0
     b1 = b - 1.0 if b >= 0.0 else b + 1.0
+    du0, du1 = a, b
+    q_best = _gram_quad(a, b, g00, g01, g11)
+    q = _gram_quad(a1, b, g00, g01, g11)
+    if q < q_best:
+        q_best = q
+        du0, du1 = a1, b
+    q = _gram_quad(a, b1, g00, g01, g11)
+    if q < q_best:
+        q_best = q
+        du0, du1 = a, b1
+    q = _gram_quad(a1, b1, g00, g01, g11)
+    if q < q_best:
+        du0, du1 = a1, b1
+    return du0, du1
 
-    r0r0 = r0 * r0
-    r1r1 = r1 * r1
-    r0r1c = r0 * r1 * cos_theta
 
-    q_best = r0r0 * a * a + 2.0 * r0r1c * a * b + r1r1 * b * b
-    du0 = a
-    du1 = b
-    for u, v in ((a1, b), (a, b1), (a1, b1)):
-        q = r0r0 * u * u + 2.0 * r0r1c * u * v + r1r1 * v * v
-        if q < q_best:
-            q_best = q
-            du0 = u
-            du1 = v
+@numba.njit(fastmath=True, cache=True)
+def _position_grad(du0, du1, g00, g01, g11, scale):
+    """
+    Gradient of the scaled torus distance wrt the first point's coordinates for
+    the selected image offset (du0, du1) under Gram (g00, g01, g11). ``scale``
+    folds in -2*diff*alpha/r. Returns (g0, g1).
+    """
+    g0 = scale * (g00 * du0 + g01 * du1)
+    g1 = scale * (g01 * du0 + g11 * du1)
+    return g0, g1
 
-    r2 = r0r0 * du0 * du0 + 2.0 * r0r1c * du0 * du1 + r1r1 * du1 * du1
+
+@numba.njit(fastmath=True, cache=True)
+def _torus_dist_grad_core(p1, p2, d, alpha, g00, g01, g11, eps):
+    """
+    Geometry-agnostic per-pair step shared by the rect and parallelogram kernels:
+    wrap the displacement, pick the closest image under Gram (g00, g01, g11), and
+    form the (alpha-free) shape length r, the position gradient and the residual
+    diff = alpha*r - d.
+
+    Returns (g0, g1, r, du0, du1, diff). The shape-parameter gradient (side lengths
+    or shear/height) is computed separately by the parametrization-specific helper.
+    """
+    du = p2 - p1
+    a = _wrap_to_half(du[0])
+    b = _wrap_to_half(du[1])
+    du0, du1 = _min_image_offset(a, b, g00, g01, g11)
+    r2 = _gram_quad(du0, du1, g00, g01, g11)
+    if r2 < 0.0:
+        r2 = 0.0
+    r = np.sqrt(r2) + eps
+    diff = alpha * r - d
+    scale = -2.0 * diff * alpha / r
+    g0, g1 = _position_grad(du0, du1, g00, g01, g11, scale)
+    return g0, g1, r, du0, du1, diff
+
+
+@numba.njit(fastmath=True, cache=True)
+def _shape_grad_rect(du0, du1, diff, r, alpha, r0, r1):
+    """Gradient wrt the two side lengths (r0, r1) for the rect (orthogonal) basis."""
+    gr0 = 2.0 * diff * alpha * r0 * du0 * du0 / r
+    gr1 = 2.0 * diff * alpha * r1 * du1 * du1 / r
+    return gr0, gr1
+
+
+@numba.njit(fastmath=True, cache=True)
+def _shape_grad_parallelogram(du0, du1, diff, r, alpha, x, y):
+    """Gradient wrt the shear x and height y for the (alpha, x, y) parametrization."""
+    gx = 2.0 * diff * alpha * du1 * (du0 + x * du1) / r
+    gy = 2.0 * diff * alpha * y * du1 * du1 / r
+    return gx, gy
+
+
+def rect_distance(p1, p2, r0=1.0, r1=1.0):
+    """
+    Shortest 2D flat-torus distance for a *rectangular* (orthogonal) fundamental
+    domain with side lengths r0, r1. Default: the unit square torus.
+
+    The metric is separable, so the per-coordinate wrap is the exact closest image
+    -- closed form, no candidate search (the core's g01 == 0 path). For an equal-side
+    rhombic torus use ``rhombic_distance``; for a general parallelogram use
+    ``parallelogram_distance``.
+    """
+    p1 = np.asarray(p1, dtype=np.float64)
+    p2 = np.asarray(p2, dtype=np.float64)
+    du = p2 - p1
+    a = _wrap_to_half(du[0])
+    b = _wrap_to_half(du[1])
+    g00 = r0 * r0
+    g11 = r1 * r1
+    du0, du1 = _min_image_offset(a, b, g00, 0.0, g11)
+    r2 = _gram_quad(du0, du1, g00, 0.0, g11)
     return float(np.sqrt(max(0.0, r2)))
+
+
+def torus_distance(p1, p2, r0=1.0, r1=1.0, theta=np.pi / 2):
+    """
+    Legacy entry point for the rectangular/rhombic flat-torus distance, kept for
+    backward compatibility (e.g. ``metrics.estimate_alpha``'s default geod).
+
+    Dispatches on the angle: theta ~ pi/2 uses the orthogonal ``rect_distance``;
+    otherwise an equal-side rhombic torus is assumed (r0 must equal r1) and
+    ``rhombic_distance`` is used. For r0 != r1 at theta != pi/2 (a general
+    parallelogram) use ``parallelogram_distance`` / ``make_torus_geod`` directly.
+    """
+    if np.isclose(theta, np.pi / 2):
+        return rect_distance(p1, p2, r0=r0, r1=r1)
+    if not np.isclose(r0, r1):
+        raise ValueError(
+            f"theta != pi/2 (theta={theta}) requires equal side lengths (r0 == r1) for "
+            "rhombic_distance; use parallelogram_distance for a general parallelogram"
+        )
+    return rhombic_distance(p1, p2, alpha=r0, theta=theta)
 
 
 def make_torus_geod(alpha=1.0, r0=1.0, r1=1.0, theta=np.pi / 2):
     """
     Return geod(p, q), the alpha-scaled flat-torus distance.
 
-    Rectangular tori (theta == pi/2) use the fast legacy ``torus_distance`` path
-    (orthogonal basis, no Gauss reduction needed); non-rectangular tori use
-    ``parallelogram_distance`` (Gauss-reduced only when necessary).
+    Rectangular tori (theta == pi/2) use the orthogonal closed-form ``rect_distance``;
+    non-rectangular tori use ``parallelogram_distance`` (Gauss-reduced only when
+    necessary).
     """
     if np.isclose(theta, np.pi / 2):
-        return lambda p, q: alpha * torus_distance(p, q, r0=r0, r1=r1, theta=theta)
+        return lambda p, q: alpha * rect_distance(p, q, r0=r0, r1=r1)
     # alpha * r0 is the overall scale of the (1, 0)-canonical shape basis.
     _, x, y = lengths_angle_to_xy(r0, r1, theta)
     return lambda p, q: parallelogram_distance(p, q, alpha=alpha * r0, x=x, y=y)
@@ -203,13 +310,35 @@ def _gauss_reduce_njit(x, y):
     return x_red, y_red, scale, u00, u01, u10, u11
 
 
+def rhombic_distance(p1, p2, alpha=1.0, theta=np.pi / 2):
+    """
+    Exact shortest flat-torus distance for an equal-side *rhombic* fundamental
+    domain: basis b0 = alpha*(1, 0), b1 = alpha*(cos theta, sin theta) (both sides
+    length alpha). theta is parametrized directly as the angle between the sides.
+
+    For theta in [pi/3, 2*pi/3] the basis is Gauss-reduced (the rhombic locus
+    |tau| = 1 is the reduced boundary), so the 4-candidate min-image search is exact.
+    """
+    p1 = np.asarray(p1, dtype=np.float64)
+    p2 = np.asarray(p2, dtype=np.float64)
+    du = p2 - p1
+    a = _wrap_to_half(du[0])
+    b = _wrap_to_half(du[1])
+    x = np.cos(theta)
+    # Gram for unit-side rhombus (alpha factored out): (1, x, 1).
+    du0, du1 = _min_image_offset(a, b, 1.0, x, 1.0)
+    r2 = _gram_quad(du0, du1, 1.0, x, 1.0)
+    return float(alpha * np.sqrt(max(0.0, r2)))
+
+
 def parallelogram_distance(p1, p2, alpha=1.0, x=0.0, y=1.0):
     """
     Exact shortest flat-torus distance for an arbitrary parallelogram fundamental
     domain with basis b0 = alpha*(1, 0), b1 = alpha*(x, y).
 
     The basis is Gauss-reduced first (so the 4-candidate search is exact for any
-    x, y), then the closest of the 4 surrounding lattice points is taken.
+    x, y), then the closest of the surrounding lattice points is taken via the
+    shared ``_min_image_offset``.
     """
     p1 = np.asarray(p1, dtype=np.float64)
     p2 = np.asarray(p2, dtype=np.float64)
@@ -224,22 +353,16 @@ def parallelogram_distance(p1, p2, alpha=1.0, x=0.0, y=1.0):
         x_red, y_red, scale, U_inv = gauss_reduce_basis(x, y)
         du_red = U_inv @ du  # offset expressed in the reduced basis coordinates
 
-    a = (du_red[0] + 0.5) - np.floor(du_red[0] + 0.5) - 0.5
-    b = (du_red[1] + 0.5) - np.floor(du_red[1] + 0.5) - 0.5
-    a1 = a - 1.0 if a >= 0.0 else a + 1.0
-    b1 = b - 1.0 if b >= 0.0 else b + 1.0
+    a = _wrap_to_half(du_red[0])
+    b = _wrap_to_half(du_red[1])
 
     s = scale * scale
     g00 = s
     g01 = s * x_red
     g11 = s * (x_red * x_red + y_red * y_red)
-
-    r2_best = g00 * a * a + 2.0 * g01 * a * b + g11 * b * b
-    for u, v in ((a1, b), (a, b1), (a1, b1)):
-        r2 = g00 * u * u + 2.0 * g01 * u * v + g11 * v * v
-        if r2 < r2_best:
-            r2_best = r2
-    return float(alpha * np.sqrt(max(0.0, r2_best)))
+    du0, du1 = _min_image_offset(a, b, g00, g01, g11)
+    r2 = _gram_quad(du0, du1, g00, g01, g11)
+    return float(alpha * np.sqrt(max(0.0, r2)))
 
 def euc_distance(p1,p2):
     return np.linalg.norm(p2-p1)
@@ -266,118 +389,45 @@ def euclidean_grad(x, y):
 
 
 @numba.njit(fastmath=True, cache=True)
-def stress_and_grad_rect_torus(p1, p2, d, alpha, r0, r1, eps=1e-12, theta=np.pi / 2):
+def rect_stress_and_grad(p1, p2, d, alpha, r0, r1, eps=1e-12):
     """
-    Stress and gradient for flat rectangular/rhombic torus MDS.
+    Stress and gradient for a flat *rectangular* (orthogonal) torus with side
+    lengths r0, r1. The metric is separable, so the per-coordinate wrap is the exact
+    closest image (the core's g01 == 0 closed form -- no candidate search).
 
-    u in [0,1)^2 (parameter space); du is min-image on unit torus wrapped to [-0.5, 0.5).
-    Geodesic offset on a torus with side lengths r0, r1 and angle theta:
-        r = ||du0 * e0 + du1 * e1||
-    with e0=(r0, 0) and e1=(r1*cos(theta), r1*sin(theta)).
-    For theta != pi/2 (rhombic), min-image is selected via 4-way check on the same metric. Exact for theta in [pi/3, 2*pi/3].
+    Loss: (alpha * r_rect - d)^2.  Returns: (loss, grad_p1, r_rect, grad_r0, grad_r1).
 
-    Loss: (alpha * r_rect - d)^2
-
-    Returns: (loss, grad_p1, r_rect, grad_r0, grad_r1)
+    g00, g01(=0), g11 depend only on (r0, r1) and are constant across an epoch's pair
+    loop; rebuilt per call for simplicity but hoistable into the SGD loop (computed
+    once per epoch) if this becomes a bottleneck.
     """
-    cos_theta = np.cos(theta)
-    du = p2 - p1
-    a = (du[0] + 0.5) - np.floor(du[0] + 0.5) - 0.5
-    b = (du[1] + 0.5) - np.floor(du[1] + 0.5) - 0.5
-    a1 = a - 1.0 if a >= 0.0 else a + 1.0
-    b1 = b - 1.0 if b >= 0.0 else b + 1.0
-    r0r0 = r0 * r0
-    r1r1 = r1 * r1
-    r0r1c = r0 * r1 * cos_theta
-
-    q_best = r0r0 * a * a + 2.0 * r0r1c * a * b + r1r1 * b * b
-    du0 = a
-    du1 = b
-    q = r0r0 * a1 * a1 + 2.0 * r0r1c * a1 * b + r1r1 * b * b
-    if q < q_best:
-        q_best = q
-        du0 = a1
-        du1 = b
-    q = r0r0 * a * a + 2.0 * r0r1c * a * b1 + r1r1 * b1 * b1
-    if q < q_best:
-        q_best = q
-        du0 = a
-        du1 = b1
-    q = r0r0 * a1 * a1 + 2.0 * r0r1c * a1 * b1 + r1r1 * b1 * b1
-    if q < q_best:
-        du0 = a1
-        du1 = b1
-
-    r2 = r0r0 * du0 * du0 + 2.0 * r0r1c * du0 * du1 + r1r1 * du1 * du1
-    if r2 < 0.0:
-        r2 = 0.0
-    r_rect = np.sqrt(r2) + eps
-    norm = alpha * r_rect
-    diff = norm - d
-
-    scale = -2.0 * diff * alpha / r_rect
-    g0 = scale * (r0r0 * du0 + r0r1c * du1)
-    g1 = scale * (r1r1 * du1 + r0r1c * du0)
-
-    gr0 = 2.0 * diff * alpha * (r0 * du0 * du0 + r1 * cos_theta * du0 * du1) / r_rect
-    gr1 = 2.0 * diff * alpha * (r1 * du1 * du1 + r0 * cos_theta * du0 * du1) / r_rect
-
+    g00 = r0 * r0
+    g11 = r1 * r1
+    g0, g1, r_rect, du0, du1, diff = _torus_dist_grad_core(p1, p2, d, alpha, g00, 0.0, g11, eps)
+    gr0, gr1 = _shape_grad_rect(du0, du1, diff, r_rect, alpha, r0, r1)
     return diff * diff, np.array((g0, g1), dtype=p1.dtype), r_rect, gr0, gr1
 
 
 @numba.njit(fastmath=True, cache=True)
-def grad_rect_torus(p1, p2, d, alpha, r0, r1, eps=1e-12, theta=np.pi / 2):
+def rect_grad(p1, p2, d, alpha, r0, r1, eps=1e-12):
     """
-    Same as stress_and_grad_rect_torus but returns only the gradient.
+    Same as rect_stress_and_grad but returns only the gradient (no stress, and g0,g1
+    returned directly rather than as an array, to avoid per-pair allocation in the
+    hot SGD loop). Returns: (g0, g1, r_rect, grad_r0, grad_r1).
 
-    Different return pattern: no stress and g0,g1 are returned directly and not as tuple
+    Orthogonal only (theta = pi/2): for equal-side rhombic or general parallelogram
+    geometry use parallelogram_grad. See rect_stress_and_grad re: the per-call Gram
+    build being hoistable.
     """
-    cos_theta = np.cos(theta)
-    du = p2 - p1
-    a = (du[0] + 0.5) - np.floor(du[0] + 0.5) - 0.5
-    b = (du[1] + 0.5) - np.floor(du[1] + 0.5) - 0.5
-    a1 = a - 1.0 if a >= 0.0 else a + 1.0
-    b1 = b - 1.0 if b >= 0.0 else b + 1.0
-    r0r0 = r0 * r0
-    r1r1 = r1 * r1
-    r0r1c = r0 * r1 * cos_theta
-
-    q_best = r0r0 * a * a + 2.0 * r0r1c * a * b + r1r1 * b * b
-    du0 = a
-    du1 = b
-    q = r0r0 * a1 * a1 + 2.0 * r0r1c * a1 * b + r1r1 * b * b
-    if q < q_best:
-        q_best = q
-        du0 = a1
-        du1 = b
-    q = r0r0 * a * a + 2.0 * r0r1c * a * b1 + r1r1 * b1 * b1
-    if q < q_best:
-        q_best = q
-        du0 = a
-        du1 = b1
-    q = r0r0 * a1 * a1 + 2.0 * r0r1c * a1 * b1 + r1r1 * b1 * b1
-    if q < q_best:
-        du0 = a1
-        du1 = b1
-
-    r2 = r0r0 * du0 * du0 + 2.0 * r0r1c * du0 * du1 + r1r1 * du1 * du1
-    if r2 < 0.0:
-        r2 = 0.0
-    r_rect = np.sqrt(r2) + eps
-    diff = alpha * r_rect - d
-
-    scale = -2.0 * diff * alpha / r_rect
-    g0 = scale * (r0r0 * du0 + r0r1c * du1)
-    g1 = scale * (r1r1 * du1 + r0r1c * du0)
-
-    gr0 = 2.0 * diff * alpha * (r0 * du0 * du0 + r1 * cos_theta * du0 * du1) / r_rect
-    gr1 = 2.0 * diff * alpha * (r1 * du1 * du1 + r0 * cos_theta * du0 * du1) / r_rect
-
+    g00 = r0 * r0
+    g11 = r1 * r1
+    g0, g1, r_rect, du0, du1, diff = _torus_dist_grad_core(p1, p2, d, alpha, g00, 0.0, g11, eps)
+    gr0, gr1 = _shape_grad_rect(du0, du1, diff, r_rect, alpha, r0, r1)
     return g0, g1, r_rect, gr0, gr1
 
 
 @numba.njit(fastmath=True, cache=True)
-def grad_parallelogram_torus(p1, p2, d, alpha, x, y, eps=1e-12):
+def parallelogram_grad(p1, p2, d, alpha, x, y, eps=1e-12):
     """
     Stress gradient for a flat parallelogram torus in the (alpha, x, y)
     parametrization. Shape metric (alpha factored out as overall scale):
@@ -386,51 +436,18 @@ def grad_parallelogram_torus(p1, p2, d, alpha, x, y, eps=1e-12):
 
     Assumes the basis is Gauss-reduced (|x| <= 1/2 and x^2 + y^2 >= 1), which the
     projector's tidy step maintains, so the plain 4-candidate min-image search is
-    exact (no per-call reduction). g0, g1 are returned directly (not as a tuple)
-    to avoid per-pair array allocation in the hot SGD loop; the per-pair loss, if
-    needed, is (alpha * r_shape - d)**2.
+    exact (no per-call reduction). If x == 0 the orthogonal closed form is taken
+    automatically. Also serves the rhombic learn mode, whose single angle gradient
+    is the equal-sides combination of (gx, gy), applied to the aggregated sums in the
+    projector's geometry update.
 
-    Returns: (g0, g1, r_shape, grad_x, grad_y)
+    The Gram (1, x, x^2+y^2) depends only on the geometry and is constant across an
+    epoch's pair loop; rebuilt per call for simplicity but hoistable into the SGD loop
+    if needed. Returns: (g0, g1, r_shape, grad_x, grad_y).
     """
-    du = p2 - p1
-    a = (du[0] + 0.5) - np.floor(du[0] + 0.5) - 0.5
-    b = (du[1] + 0.5) - np.floor(du[1] + 0.5) - 0.5
-    a1 = a - 1.0 if a >= 0.0 else a + 1.0
-    b1 = b - 1.0 if b >= 0.0 else b + 1.0
-
     g11 = x * x + y * y
-
-    q_best = a * a + 2.0 * x * a * b + g11 * b * b
-    du0 = a
-    du1 = b
-    q = a1 * a1 + 2.0 * x * a1 * b + g11 * b * b
-    if q < q_best:
-        q_best = q
-        du0 = a1
-        du1 = b
-    q = a * a + 2.0 * x * a * b1 + g11 * b1 * b1
-    if q < q_best:
-        q_best = q
-        du0 = a
-        du1 = b1
-    q = a1 * a1 + 2.0 * x * a1 * b1 + g11 * b1 * b1
-    if q < q_best:
-        du0 = a1
-        du1 = b1
-
-    r2 = du0 * du0 + 2.0 * x * du0 * du1 + g11 * du1 * du1
-    if r2 < 0.0:
-        r2 = 0.0
-    r_shape = np.sqrt(r2) + eps
-    diff = alpha * r_shape - d
-
-    scale = -2.0 * diff * alpha / r_shape
-    g0 = scale * (du0 + x * du1)
-    g1 = scale * (x * du0 + g11 * du1)
-
-    gx = 2.0 * diff * alpha * du1 * (du0 + x * du1) / r_shape
-    gy = 2.0 * diff * alpha * y * du1 * du1 / r_shape
-
+    g0, g1, r_shape, du0, du1, diff = _torus_dist_grad_core(p1, p2, d, alpha, 1.0, x, g11, eps)
+    gx, gy = _shape_grad_parallelogram(du0, du1, diff, r_shape, alpha, x, y)
     return g0, g1, r_shape, gx, gy
 
 

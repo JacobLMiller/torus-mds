@@ -1,5 +1,7 @@
 from .geometry import (
     torus_distance,
+    rect_distance,
+    rhombic_distance,
     parallelogram_distance,
     gauss_reduce_basis,
     lengths_angle_to_xy,
@@ -9,8 +11,9 @@ from .geometry import (
     make_torus_geod,
     torus_grad,
     euclidean_grad,
-    stress_and_grad_rect_torus,
-    grad_parallelogram_torus,
+    rect_grad,
+    rect_stress_and_grad,
+    parallelogram_grad,
     torus_delta,
     torus_edge_segments,
 )

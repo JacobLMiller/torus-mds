@@ -8,8 +8,8 @@ import numba
 from numba.typed import List as NumbaList
 
 from .geometry import (
-    grad_rect_torus,
-    grad_parallelogram_torus,
+    rect_grad,
+    parallelogram_grad,
     _gauss_reduce_njit,
     lengths_angle_to_xy,
     xy_to_lengths_angle,
@@ -76,8 +76,15 @@ def _update_parallelogram_geom(
     """
     One batch geometry update for the parallelogram learn modes (alpha, x, y).
 
-    learn_mode == 5 ('rhombic'):       equal sides, y = sqrt(1 - x^2); learn the
-        angle via x (clamped to [-1/2, 1/2], i.e. angle in [60, 120] deg). Always
+    Both modes reuse the SAME gradient kernel (parallelogram_grad), which treats x and
+    y as independent and accumulates gx_sum = sum_pairs dL/dx and gy_sum = sum_pairs
+    dL/dy. The rhombic-vs-parallelogram distinction is applied HERE, as a constraint on
+    how (x, y) may move -- there is no separate rhombic gradient kernel.
+
+    learn_mode == 5 ('rhombic'):       equal sides, so b1 = (x, y) is forced onto the
+        unit circle y = sqrt(1 - x^2). That leaves a single free parameter (x = cos of
+        the angle); the constraint is folded into the gradient by the chain rule below.
+        x is clamped to [-1/2, 1/2] (angle in [60, 120] deg), where the basis stays
         Gauss-reduced, so no tidy is needed.
     learn_mode == 6 ('parallelogram'): free shape via (x, y_raw) with
         y = sqrt(1 - x^2) + softplus(y_raw); a tidy step Gauss-reduces and shears
@@ -94,15 +101,25 @@ def _update_parallelogram_geom(
     inv_base = x / base if base > 1e-9 else 0.0  # d(sqrt(1-x^2))/dx = -x/base
 
     if learn_mode == 5:
-        # dL/dx = gx + gy * d y / d x,  with y = sqrt(1 - x^2)
+        # Rhombic: y is tied to x by y = sqrt(1 - x^2), so the only free parameter is x.
+        # By the chain rule the total derivative wrt x is
+        #     dL/dx = dL/dx|_y + (dL/dy)*(dy/dx) = gx - gy * x/base.
+        # dy/dx depends only on the current x (not on the pair), so it factors out of the
+        # sum over pairs -- we apply it once to the aggregated gx_sum, gy_sum here rather
+        # than per pair in the kernel (hence no dedicated rhombic gradient kernel).
         dx = gx_sum - gy_sum * inv_base
         x = x - geom_lr * dx / used
         if x < -0.5:
             x = -0.5
         elif x > 0.5:
             x = 0.5
+        # Re-project b1 back onto the unit circle (restore the equal-sides constraint).
         y = np.sqrt(max(0.0, 1.0 - x * x))
     else:
+        # Parallelogram: x and the height move independently. The learnable height is
+        # y = sqrt(1 - x^2) + softplus(y_raw); chain-rule each parameter separately --
+        # dL/dx still carries the sqrt(1 - x^2) term (gx - gy * x/base), while the
+        # softplus part of the height is driven by dL/dy_raw = gy * sigmoid(y_raw).
         sig = 1.0 / (1.0 + np.exp(-y_raw))  # d softplus / d y_raw
         dx = gx_sum - gy_sum * inv_base
         dyr = gy_sum * sig
@@ -187,6 +204,10 @@ def _sgd_minibatch_njit_legacy(
     x = x_init
     y = y_init
     y_raw = _init_parallelogram_yraw(x, y) if learn_mode == 6 else 0.0
+    # Orthogonal closed-form rect path only when theta == pi/2. Equal-side rhombic
+    # (legacy modes 0/1 at theta != 90, seeded x=cos t, y=sin t) and modes 5/6 use
+    # the parallelogram kernel. theta and learn_mode are constant, so decide once.
+    use_rect = learn_mode <= 4 and abs(np.cos(theta)) < 1e-12
     if learn_mode == 4:
         aspect_scale = np.sqrt(max(geom_min, r0 * r1))
         alpha *= aspect_scale
@@ -222,18 +243,18 @@ def _sgd_minibatch_njit_legacy(
                 continue
 
             d = data[i, j]
-            if learn_mode >= 5:
-                g0, g1, dist, ga, gb = grad_parallelogram_torus(
+            if use_rect:
+                g0, g1, dist, gr0_k, gr1_k = rect_grad(
+                    params[i], params[j], d, alpha, r0, r1, eps
+                )
+                gr0_sum += gr0_k
+                gr1_sum += gr1_k
+            else:
+                g0, g1, dist, ga, gb = parallelogram_grad(
                     params[i], params[j], d, alpha, x, y, eps
                 )
                 gx_sum += ga
                 gy_sum += gb
-            else:
-                g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
-                    params[i], params[j], d, alpha, r0, r1, eps, theta
-                )
-                gr0_sum += gr0_k
-                gr1_sum += gr1_k
 
             params[i, 0] -= step_pos * g0
             params[i, 1] -= step_pos * g1
@@ -308,6 +329,10 @@ def _run_pair_sequence_online_njit(
     x = x_init
     y = y_init
     y_raw = _init_parallelogram_yraw(x, y) if learn_mode == 6 else 0.0
+    # Orthogonal closed-form rect path only when theta == pi/2. Equal-side rhombic
+    # (legacy modes 0/1 at theta != 90, seeded x=cos t, y=sin t) and modes 5/6 use
+    # the parallelogram kernel. theta and learn_mode are constant, so decide once.
+    use_rect = learn_mode <= 4 and abs(np.cos(theta)) < 1e-12
     if learn_mode == 4:
         aspect_scale = np.sqrt(max(geom_min, r0 * r1))
         alpha *= aspect_scale
@@ -342,18 +367,18 @@ def _run_pair_sequence_online_njit(
             j = seq[k, 1]
 
             d = data[i, j]
-            if learn_mode >= 5:
-                g0, g1, dist, ga, gb = grad_parallelogram_torus(
+            if use_rect:
+                g0, g1, dist, gr0_k, gr1_k = rect_grad(
+                    params[i], params[j], d, alpha, r0, r1, eps
+                )
+                gr0_sum += gr0_k
+                gr1_sum += gr1_k
+            else:
+                g0, g1, dist, ga, gb = parallelogram_grad(
                     params[i], params[j], d, alpha, x, y, eps
                 )
                 gx_sum += ga
                 gy_sum += gb
-            else:
-                g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
-                    params[i], params[j], d, alpha, r0, r1, eps, theta
-                )
-                gr0_sum += gr0_k
-                gr1_sum += gr1_k
 
             params[i, 0] -= step_pos * g0
             params[i, 1] -= step_pos * g1
@@ -567,7 +592,14 @@ class MDSTorusProjector(TorusProjector):
                 )
         theta_rad = float(np.radians(theta))
 
-        # Initial shear/height for the parallelogram modes (5, 6).
+        # Legacy 'fixed'/'alpha' at theta != 90 is an equal-side rhombic torus; it now
+        # runs on the parallelogram kernel (rect_grad is orthogonal only). The (x, y)
+        # unit-circle basis carries no side length, so the fixed side length r0_init is
+        # folded into the parallelogram scale here and unfolded out of alpha_ on report.
+        non_orth_rect = mode_int in (0, 1) and theta != 90.0
+
+        # Initial shear/height for the parallelogram modes (5, 6) and the legacy rhombic
+        # path. lengths_angle_to_xy returns the unit-circle (cos t, sin t) for equal sides.
         if x_init is None or y_init is None:
             _, x0, y0 = lengths_angle_to_xy(r0_init, r1_init, theta_rad)
         else:
@@ -577,6 +609,8 @@ class MDSTorusProjector(TorusProjector):
             x0, y0 = float(np.cos(theta_rad)), float(np.sin(theta_rad))
         if mode_int == 6 and x_init is None and abs(x0) < 1e-6:
             x0 = 0.05  # asymmetric init to escape the x -> -x (rectangular) saddle
+
+        alpha_kernel = alpha_init * r0_init if non_orth_rect else alpha_init
 
         if sampled_unique:
             sgd_fn = sgd_minibatch_njit # sample pairs without replacement
@@ -589,7 +623,7 @@ class MDSTorusProjector(TorusProjector):
             max_iters=max_iters,
             batch_pairs=batch_size,
             seed=seed,
-            alpha_init=alpha_init,
+            alpha_init=alpha_kernel,
             r0_init=r0_init,
             r1_init=r1_init,
             learn_mode=mode_int,
@@ -599,14 +633,17 @@ class MDSTorusProjector(TorusProjector):
             y_init=y0,
         )
 
-        self.alpha_ = float(alpha)
         if mode_int >= 5:
             # Report learned (alpha, x, y) as side lengths + angle; the b0 length
             # lives in alpha_, so r0_ = 1 and r1_ = |b1| / |b0|.
+            self.alpha_ = float(alpha)
             self.x_ = float(x)
             self.y_ = float(y)
             self.r0_, self.r1_, self.theta_ = xy_to_lengths_angle(1.0, x, y)
         else:
+            # Unfold the side length folded into the parallelogram scale for the legacy
+            # rhombic path; a no-op (divide by 1) for the orthogonal rect modes.
+            self.alpha_ = float(alpha) / r0_init if non_orth_rect else float(alpha)
             self.r0_ = float(r0)
             self.r1_ = float(r1)
             self.theta_ = theta_rad

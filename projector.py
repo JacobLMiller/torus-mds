@@ -11,8 +11,13 @@ from modules.projector import (
 )
 from modules.geometry import (
     torus_distance,
+    rect_distance,
+    rhombic_distance,
+    parallelogram_distance,
     make_torus_geod,
     torus_grad,
     euclidean_grad,
-    stress_and_grad_rect_torus,
+    rect_grad,
+    rect_stress_and_grad,
+    parallelogram_grad,
 )
