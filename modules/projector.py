@@ -67,6 +67,25 @@ def _build_sampled_unique_pair_sequence_from_pairs(
     return result
 
 
+@numba.njit(cache=True, fastmath=True)
+def _batch_stress_njit(data, params, pairs, alpha, r0, r1, x, y, use_rect, eps=1e-12):
+    """Normalised stress on a fixed pair sample: sum((alpha*r-d)^2) / sum(d^2)."""
+    total_loss = 0.0
+    total_d2 = 0.0
+    for k in range(pairs.shape[0]):
+        i = pairs[k, 0]
+        j = pairs[k, 1]
+        d = data[i, j]
+        if use_rect:
+            _, _, r, _, _ = rect_grad(params[i], params[j], d, alpha, r0, r1, eps)
+        else:
+            _, _, r, _, _ = parallelogram_grad(params[i], params[j], d, alpha, x, y, eps)
+        diff = alpha * r - d
+        total_loss += diff * diff
+        total_d2 += d * d
+    return total_loss / (total_d2 + eps)
+
+
 
 @numba.njit(cache=True, fastmath=True)
 def _update_parallelogram_geom(
@@ -179,6 +198,8 @@ def _sgd_minibatch_njit_legacy(
     theta=np.pi / 2,
     x_init=0.0,
     y_init=1.0,
+    lr_warmup_init=10.0,
+    lr_warmup_decay=25.0,
 ):
     """
     Minibatch SGD for torus MDS on a flat parallelogram torus.
@@ -193,6 +214,12 @@ def _sgd_minibatch_njit_legacy(
 
     Modes 5/6 use the (alpha, x, y) parametrization (x_init, y_init); modes 0-4 use
     (r0_init, r1_init, theta). Returns: (params, alpha, r0, r1, x, y).
+
+    Position step size follows an exponentially-decaying warmup on top of the
+    harmonic tail: step = lr_warmup_init * exp(-it/lr_warmup_decay) + 1/(learning_rate+it),
+    floored at 1e-4. The warmup term vanishes after a few multiples of
+    lr_warmup_decay, leaving the plain harmonic decay of the tail. Set
+    lr_warmup_init=0 to recover the old pure-harmonic schedule.
     """
     n = data.shape[0]
     np.random.seed(seed)
@@ -222,7 +249,10 @@ def _sgd_minibatch_njit_legacy(
         log_aspect = 0.0
 
     for it in range(max_iters):
-        step_pos = max(1.0 / (learning_rate + it), 1e-4)
+        step_pos = max(
+            lr_warmup_init * np.exp(-it / lr_warmup_decay) + 1.0 / (learning_rate + it),
+            1e-4,
+        )
         if learn_mode == 4:
             r0 = np.exp(-0.5 * log_aspect)
             r1 = np.exp(0.5 * log_aspect)
@@ -321,6 +351,8 @@ def _run_pair_sequence_online_njit(
     theta=np.pi / 2,
     x_init=0.0,
     y_init=1.0,
+    lr_warmup_init=10.0,
+    lr_warmup_decay=25.0,
 ):
     params = init_params.copy()
     alpha = alpha_init
@@ -348,7 +380,11 @@ def _run_pair_sequence_online_njit(
     epochs = len(pair_sequence)
 
     for it in range(epochs):
-        step_pos = max(1.0 / (learning_rate + start_iter + it), 1e-4)
+        global_it = start_iter + it
+        step_pos = max(
+            lr_warmup_init * np.exp(-global_it / lr_warmup_decay) + 1.0 / (learning_rate + global_it),
+            1e-4,
+        )
         if learn_mode == 4:
             r0 = np.exp(-0.5 * log_aspect)
             r1 = np.exp(0.5 * log_aspect)
@@ -443,6 +479,10 @@ def sgd_minibatch_njit(
     x_init=0.0,
     y_init=1.0,
     chunk_epochs=DEFAULT_SEQUENCE_CHUNK_EPOCHS,
+    lr_warmup_init=10.0,
+    lr_warmup_decay=25.0,
+    tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
+    patience: int = 5,    # non-improving chunks before stopping
 ):
     """
     Minibatch SGD for torus MDS using online updates over unique sampled pairs.
@@ -464,6 +504,17 @@ def sgd_minibatch_njit(
 
     rng = np.random.default_rng(seed)
     pairs = _all_unique_pairs(n)
+    use_rect = learn_mode <= 4 and abs(np.cos(theta)) < 1e-12
+
+    stress_sample = None
+    bad_chunks = 0
+    prev_stress = np.inf
+    if tol > 0.0:
+        num_pairs = n * (n - 1) // 2
+        n_stress = min(max(256, batch_pairs), num_pairs)
+        idx = rng.choice(num_pairs, size=n_stress, replace=False)
+        stress_sample = pairs[idx].astype(np.int32)
+
     start_iter = 0
     while start_iter < max_iters:
         epochs = min(chunk_epochs, max_iters - start_iter)
@@ -487,8 +538,22 @@ def sgd_minibatch_njit(
             theta=theta,
             x_init=x,
             y_init=y,
+            lr_warmup_init=lr_warmup_init,
+            lr_warmup_decay=lr_warmup_decay,
         )
         start_iter += epochs
+
+        if tol > 0.0:
+            curr_stress = _batch_stress_njit(data, params, stress_sample, alpha, r0, r1, x, y, use_rect, eps)
+            rel_change = abs(prev_stress - curr_stress) / max(prev_stress, 1e-12)
+            if rel_change < tol:
+                bad_chunks += 1
+                if bad_chunks >= patience:
+                    break
+            else:
+                bad_chunks = 0
+            prev_stress = curr_stress
+
     return params, alpha, r0, r1, x, y
 
 
@@ -564,6 +629,12 @@ class MDSTorusProjector(TorusProjector):
             theta=90.0,           # torus angle in degrees; must be in [60, 120]
             x_init=None,          # initial shear (parallelogram/rhombic); default derived from theta
             y_init=None,          # initial height (parallelogram)
+            # --- position step-size schedule ---
+            lr_warmup_init: float = 10.0,   # extra step size at epoch 0, decays away
+            lr_warmup_decay: float = 25.0,  # e-folding scale (epochs) of the warmup
+            # --- convergence criteria (sampled_unique path only) ---
+            tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
+            patience: int = 5,    # non-improving chunks before stopping
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
@@ -612,12 +683,7 @@ class MDSTorusProjector(TorusProjector):
 
         alpha_kernel = alpha_init * r0_init if non_orth_rect else alpha_init
 
-        if sampled_unique:
-            sgd_fn = sgd_minibatch_njit # sample pairs without replacement
-        else:
-            sgd_fn = _sgd_minibatch_njit_legacy # sample pairs with replacement
-
-        coords, alpha, r0, r1, x, y = sgd_fn(
+        kwargs = dict(
             data=data,
             learning_rate=self.learning_rate,
             max_iters=max_iters,
@@ -631,7 +697,17 @@ class MDSTorusProjector(TorusProjector):
             theta=theta_rad,
             x_init=x0,
             y_init=y0,
+            lr_warmup_init=lr_warmup_init,
+            lr_warmup_decay=lr_warmup_decay,
         )
+        if sampled_unique:
+            sgd_fn = sgd_minibatch_njit  # sample pairs without replacement; supports early stopping
+            kwargs["tol"] = tol
+            kwargs["patience"] = patience
+        else:
+            sgd_fn = _sgd_minibatch_njit_legacy  # sample pairs with replacement; no early stopping
+
+        coords, alpha, r0, r1, x, y = sgd_fn(**kwargs)
 
         if mode_int >= 5:
             # Report learned (alpha, x, y) as side lengths + angle; the b0 length
