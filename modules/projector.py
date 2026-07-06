@@ -7,14 +7,16 @@ import numpy as np
 import numba
 from numba.typed import List as NumbaList
 
-from .geometry import grad_rect_torus, torus_grad, stress_and_grad_rect_torus
+from .geometry import (
+    rect_grad,
+    parallelogram_grad,
+    _gauss_reduce_njit,
+    lengths_angle_to_xy,
+    xy_to_lengths_angle,
+    torus_grad,
+)
 
 DEFAULT_SEQUENCE_CHUNK_EPOCHS = 128
-# Old fixed defaults (max_iters=10000, batch capped at 4096) implied this many
-# total pair-updates; used to size max_iters when batch_fraction shrinks the
-# per-epoch batch below 4096, so smaller batches just run more epochs instead
-# of training on strictly less data.
-DEFAULT_TARGET_PAIR_UPDATES = 10000 * 4096
 
 
 def _check_distance_matrix(D: np.ndarray) -> np.ndarray:
@@ -65,100 +67,96 @@ def _build_sampled_unique_pair_sequence_from_pairs(
     return result
 
 
-def _resolve_batch_pairs(
-    n: int,
-    batch_size: int,
-    batch_fraction,
-) -> int:
-    """Compute actual batch pair count from batch_size or a fraction/formula.
 
-    batch_fraction=None          → min(batch_size, C(n,2))  [current behaviour]
-    batch_fraction=float (0..1)  → max(1, int(frac * C(n,2)))
-    batch_fraction='sqrt_n'      → max(1, int(sqrt(n)))
-    batch_fraction='sqrt_pairs'  → max(1, int(sqrt(C(n,2))))
+@numba.njit(cache=True, fastmath=True)
+def _update_parallelogram_geom(
+    params, learn_mode, num, den, gx_sum, gy_sum, used,
+    alpha, x, y, y_raw, alpha_ema, alpha_min, alpha_max, geom_lr, eps,
+):
     """
-    num_pairs = n * (n - 1) // 2
-    if batch_fraction is None:
-        return min(batch_size, num_pairs)
-    if isinstance(batch_fraction, float):
-        return max(1, int(batch_fraction * num_pairs))
-    if batch_fraction == 'sqrt_n':
-        return max(1, int(np.sqrt(n)))
-    if batch_fraction == 'sqrt_pairs':
-        return max(1, int(np.sqrt(num_pairs)))
-    raise ValueError(
-        f"Unknown batch_fraction {batch_fraction!r}; "
-        "expected None, a float in (0,1], 'sqrt_n', or 'sqrt_pairs'."
-    )
+    One batch geometry update for the parallelogram learn modes (alpha, x, y).
 
+    Both modes reuse the SAME gradient kernel (parallelogram_grad), which treats x and
+    y as independent and accumulates gx_sum = sum_pairs dL/dx and gy_sum = sum_pairs
+    dL/dy. The rhombic-vs-parallelogram distinction is applied HERE, as a constraint on
+    how (x, y) may move -- there is no separate rhombic gradient kernel.
 
-def _build_vertex_k_pair_sequence(
-    n: int,
-    vertex_k: int,
-    rng: np.random.Generator,
-    epochs: int,
-) -> NumbaList:
-    """For each epoch: for every node i, sample vertex_k distinct partners j != i.
+    learn_mode == 5 ('rhombic'):       equal sides, so b1 = (x, y) is forced onto the
+        unit circle y = sqrt(1 - x^2). That leaves a single free parameter (x = cos of
+        the angle); the constraint is folded into the gradient by the chain rule below.
+        x is clamped to [-1/2, 1/2] (angle in [60, 120] deg), where the basis stays
+        Gauss-reduced, so no tidy is needed.
+    learn_mode == 6 ('parallelogram'): free shape via (x, y_raw) with
+        y = sqrt(1 - x^2) + softplus(y_raw); a tidy step Gauss-reduces and shears
+        the positions whenever |x| > 1/2.
 
-    Produces n * min(vertex_k, n-1) directed pairs per epoch.
-    Uses rng.permuted to shuffle all n candidate lists simultaneously.
+    alpha is the closed-form least-squares scale (EMA-smoothed). Returns the
+    updated (alpha, x, y, y_raw); params may be sheared in place by the tidy.
     """
-    k = min(vertex_k, n - 1)
-    # mapped[i, :] = all nodes reachable from i (excludes i itself),
-    # in a fixed canonical order; shuffled each epoch.
-    base = np.tile(np.arange(n - 1, dtype=np.int32), (n, 1))   # (n, n-1)
-    offsets = np.arange(n, dtype=np.int32)[:, None]             # (n, 1)
-    mapped = np.where(base >= offsets, base + 1, base)          # (n, n-1)
+    alpha_hat = num / (den + eps)
+    alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
+    alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
 
-    sources = np.repeat(np.arange(n, dtype=np.int32), k)
-    result = NumbaList()
-    for _ in range(epochs):
-        shuffled = rng.permuted(mapped, axis=1)                 # row-wise independent shuffle
-        targets = shuffled[:, :k].ravel().astype(np.int32)
-        result.append(np.column_stack([sources, targets]))
-    return result
+    base = np.sqrt(max(0.0, 1.0 - x * x))
+    inv_base = x / base if base > 1e-9 else 0.0  # d(sqrt(1-x^2))/dx = -x/base
 
+    if learn_mode == 5:
+        # Rhombic: y is tied to x by y = sqrt(1 - x^2), so the only free parameter is x.
+        # By the chain rule the total derivative wrt x is
+        #     dL/dx = dL/dx|_y + (dL/dy)*(dy/dx) = gx - gy * x/base.
+        # dy/dx depends only on the current x (not on the pair), so it factors out of the
+        # sum over pairs -- we apply it once to the aggregated gx_sum, gy_sum here rather
+        # than per pair in the kernel (hence no dedicated rhombic gradient kernel).
+        dx = gx_sum - gy_sum * inv_base
+        x = x - geom_lr * dx / used
+        if x < -0.5:
+            x = -0.5
+        elif x > 0.5:
+            x = 0.5
+        # Re-project b1 back onto the unit circle (restore the equal-sides constraint).
+        y = np.sqrt(max(0.0, 1.0 - x * x))
+    else:
+        # Parallelogram: x and the height move independently. The learnable height is
+        # y = sqrt(1 - x^2) + softplus(y_raw); chain-rule each parameter separately --
+        # dL/dx still carries the sqrt(1 - x^2) term (gx - gy * x/base), while the
+        # softplus part of the height is driven by dL/dy_raw = gy * sigmoid(y_raw).
+        sig = 1.0 / (1.0 + np.exp(-y_raw))  # d softplus / d y_raw
+        dx = gx_sum - gy_sum * inv_base
+        dyr = gy_sum * sig
+        x = x - geom_lr * dx / used
+        y_raw = y_raw - geom_lr * dyr / used
+        base = np.sqrt(max(0.0, 1.0 - x * x))
+        # stable softplus = log(1 + exp(y_raw)) (numba lacks np.logaddexp)
+        softplus = max(y_raw, 0.0) + np.log1p(np.exp(-abs(y_raw)))
+        y = base + softplus
 
-def _build_node_k_pair_sequence(
-    n: int,
-    node_k: int,
-    rng: np.random.Generator,
-    epochs: int,
-) -> NumbaList:
-    """For each epoch: sample node_k nodes uniformly, shuffle, pair consecutively.
+        if abs(x) > 0.5:  # tidy: reduce, shear positions, fold scale, translate back
+            xr, yr, scale, u00, u01, u10, u11 = _gauss_reduce_njit(x, y)
+            for p in range(params.shape[0]):
+                s0 = params[p, 0]
+                s1 = params[p, 1]
+                params[p, 0] = (u00 * s0 + u01 * s1) % 1.0
+                params[p, 1] = (u10 * s0 + u11 * s1) % 1.0
+            alpha = alpha * scale
+            x = xr
+            y = yr
+            base = np.sqrt(max(0.0, 1.0 - x * x))
+            spv = y - base
+            if spv < 1e-12:
+                spv = 1e-12
+            y_raw = np.log(np.expm1(spv))
 
-    Produces node_k // 2 disjoint pairs per epoch.
-    Each pair covers two distinct nodes; no node appears twice in the same batch.
-    """
-    k = min(node_k, n)
-    k -= k % 2  # round down to even so pairing is clean
-    if k < 2:
-        raise ValueError(
-            f"node_k must yield at least 2 sampled nodes; got k={k} "
-            f"(node_k={node_k}, n={n})."
-        )
-    result = NumbaList()
-    for _ in range(epochs):
-        nodes = rng.choice(n, size=k, replace=False).astype(np.int32)
-        result.append(nodes.reshape(-1, 2))
-    return result
+    return alpha, x, y, y_raw
 
 
 @numba.njit(cache=True, fastmath=True)
-def _batch_stress_njit(data, params, pairs, alpha, r0, r1, theta, eps=1e-12):
-    """Normalised stress on a fixed pair sample: sum((alpha*r - d)^2) / sum(d^2)."""
-    total_loss = 0.0
-    total_d2 = 0.0
-    for k in range(pairs.shape[0]):
-        i = pairs[k, 0]
-        j = pairs[k, 1]
-        d = data[i, j]
-        loss, g, r, gr0, gr1 = stress_and_grad_rect_torus(
-            params[i], params[j], d, alpha, r0, r1, eps, theta
-        )
-        total_loss += loss
-        total_d2 += d * d
-    return total_loss / (total_d2 + eps)
+def _init_parallelogram_yraw(x, y):
+    """Inverse-softplus initialization of y_raw so sqrt(1-x^2)+softplus(y_raw)==y."""
+    base = np.sqrt(max(0.0, 1.0 - x * x))
+    spv = y - base
+    if spv < 1e-12:
+        spv = 1e-12
+    return np.log(np.expm1(spv))
 
 
 @numba.njit(cache=True, fastmath=True)
@@ -175,28 +173,26 @@ def _sgd_minibatch_njit_legacy(
     alpha_max=1e6,
     r0_init=1.0,
     r1_init=1.0,
-    learn_mode=0,   # 0=fixed, 1=alpha, 2=square, 3=rectangular, 4=alpha_aspect
+    learn_mode=0,   # 0=fixed,1=alpha,2=square,3=rectangular,4=alpha_aspect,5=rhombic,6=parallelogram
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
-    lr_warmup_init=10.0,
-    lr_warmup_decay=25.0,
+    x_init=0.0,
+    y_init=1.0,
 ):
     """
-    Minibatch SGD for torus MDS on a flat rectangular/rhombic torus.
+    Minibatch SGD for torus MDS on a flat parallelogram torus.
 
-    learn_mode=0 ('fixed'):    positions only; alpha, r0, r1 fixed.
-    learn_mode=1 ('alpha'):    positions + alpha via closed-form batch minimiser + EMA.
-    learn_mode=2 ('square'):   positions + shared r = r0 = r1 via SGD; alpha fixed.
+    learn_mode=0 ('fixed'):       positions only; geometry fixed.
+    learn_mode=1 ('alpha'):       positions + alpha via closed-form minimiser + EMA.
+    learn_mode=2 ('square'):      positions + shared r = r0 = r1 via SGD; alpha fixed.
     learn_mode=3 ('rectangular'): positions + independent r0, r1 via SGD; alpha fixed.
+    learn_mode=4 ('alpha_aspect'): positions + alpha + log-aspect.
+    learn_mode=5 ('rhombic'):     positions + alpha + rhombus angle (shear x), equal sides.
+    learn_mode=6 ('parallelogram'): positions + alpha + free shear x and height y.
 
-    Position step size follows an exponentially-decaying warmup on top of the
-    harmonic tail: step = lr_warmup_init * exp(-it/lr_warmup_decay) + 1/(learning_rate+it),
-    floored at 1e-4. The warmup term vanishes after a few multiples of
-    lr_warmup_decay, leaving the plain harmonic decay of the tail. Set
-    lr_warmup_init=0 to recover the old pure-harmonic schedule.
-
-    Returns: (params, alpha, r0, r1)
+    Modes 5/6 use the (alpha, x, y) parametrization (x_init, y_init); modes 0-4 use
+    (r0_init, r1_init, theta). Returns: (params, alpha, r0, r1, x, y).
     """
     n = data.shape[0]
     np.random.seed(seed)
@@ -205,6 +201,13 @@ def _sgd_minibatch_njit_legacy(
     alpha = alpha_init
     r0 = r0_init
     r1 = r1_init
+    x = x_init
+    y = y_init
+    y_raw = _init_parallelogram_yraw(x, y) if learn_mode == 6 else 0.0
+    # Orthogonal closed-form rect path only when theta == pi/2. Equal-side rhombic
+    # (legacy modes 0/1 at theta != 90, seeded x=cos t, y=sin t) and modes 5/6 use
+    # the parallelogram kernel. theta and learn_mode are constant, so decide once.
+    use_rect = learn_mode <= 4 and abs(np.cos(theta)) < 1e-12
     if learn_mode == 4:
         aspect_scale = np.sqrt(max(geom_min, r0 * r1))
         alpha *= aspect_scale
@@ -219,10 +222,7 @@ def _sgd_minibatch_njit_legacy(
         log_aspect = 0.0
 
     for it in range(max_iters):
-        step_pos = max(
-            lr_warmup_init * np.exp(-it / lr_warmup_decay) + 1.0 / (learning_rate + it),
-            1e-4,
-        )
+        step_pos = max(1.0 / (learning_rate + it), 1e-4)
         if learn_mode == 4:
             r0 = np.exp(-0.5 * log_aspect)
             r1 = np.exp(0.5 * log_aspect)
@@ -231,6 +231,8 @@ def _sgd_minibatch_njit_legacy(
         den = 0.0
         gr0_sum = 0.0
         gr1_sum = 0.0
+        gx_sum = 0.0
+        gy_sum = 0.0
         used = 0
         drawn = 0
 
@@ -241,9 +243,18 @@ def _sgd_minibatch_njit_legacy(
                 continue
 
             d = data[i, j]
-            g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
-                params[i], params[j], d, alpha, r0, r1, eps, theta
-            )
+            if use_rect:
+                g0, g1, dist, gr0_k, gr1_k = rect_grad(
+                    params[i], params[j], d, alpha, r0, r1, eps
+                )
+                gr0_sum += gr0_k
+                gr1_sum += gr1_k
+            else:
+                g0, g1, dist, ga, gb = parallelogram_grad(
+                    params[i], params[j], d, alpha, x, y, eps
+                )
+                gx_sum += ga
+                gy_sum += gb
 
             params[i, 0] -= step_pos * g0
             params[i, 1] -= step_pos * g1
@@ -252,8 +263,6 @@ def _sgd_minibatch_njit_legacy(
 
             num += d * dist
             den += dist * dist
-            gr0_sum += gr0_k
-            gr1_sum += gr1_k
             used += 1
             drawn += 1
 
@@ -283,8 +292,13 @@ def _sgd_minibatch_njit_legacy(
                     log_aspect = 6.0
                 r0 = np.exp(-0.5 * log_aspect)
                 r1 = np.exp(0.5 * log_aspect)
+            elif learn_mode >= 5:
+                alpha, x, y, y_raw = _update_parallelogram_geom(
+                    params, learn_mode, num, den, gx_sum, gy_sum, used,
+                    alpha, x, y, y_raw, alpha_ema, alpha_min, alpha_max, geom_lr, eps,
+                )
 
-    return params, alpha, r0, r1
+    return params, alpha, r0, r1, x, y
 
 
 @numba.njit(cache=True, fastmath=True)
@@ -301,17 +315,24 @@ def _run_pair_sequence_online_njit(
     alpha_max=1e6,
     r0_init=1.0,
     r1_init=1.0,
-    learn_mode=0,   # 0=fixed, 1=alpha, 2=square, 3=rectangular, 4=alpha_aspect
+    learn_mode=0,   # 0=fixed,1=alpha,2=square,3=rectangular,4=alpha_aspect,5=rhombic,6=parallelogram
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
-    lr_warmup_init=10.0,
-    lr_warmup_decay=25.0,
+    x_init=0.0,
+    y_init=1.0,
 ):
     params = init_params.copy()
     alpha = alpha_init
     r0 = r0_init
     r1 = r1_init
+    x = x_init
+    y = y_init
+    y_raw = _init_parallelogram_yraw(x, y) if learn_mode == 6 else 0.0
+    # Orthogonal closed-form rect path only when theta == pi/2. Equal-side rhombic
+    # (legacy modes 0/1 at theta != 90, seeded x=cos t, y=sin t) and modes 5/6 use
+    # the parallelogram kernel. theta and learn_mode are constant, so decide once.
+    use_rect = learn_mode <= 4 and abs(np.cos(theta)) < 1e-12
     if learn_mode == 4:
         aspect_scale = np.sqrt(max(geom_min, r0 * r1))
         alpha *= aspect_scale
@@ -327,11 +348,7 @@ def _run_pair_sequence_online_njit(
     epochs = len(pair_sequence)
 
     for it in range(epochs):
-        global_it = start_iter + it
-        step_pos = max(
-            lr_warmup_init * np.exp(-global_it / lr_warmup_decay) + 1.0 / (learning_rate + global_it),
-            1e-4,
-        )
+        step_pos = max(1.0 / (learning_rate + start_iter + it), 1e-4)
         if learn_mode == 4:
             r0 = np.exp(-0.5 * log_aspect)
             r1 = np.exp(0.5 * log_aspect)
@@ -343,14 +360,25 @@ def _run_pair_sequence_online_njit(
         den = 0.0
         gr0_sum = 0.0
         gr1_sum = 0.0
+        gx_sum = 0.0
+        gy_sum = 0.0
         for k in range(used):
             i = seq[k, 0]
             j = seq[k, 1]
 
             d = data[i, j]
-            g0, g1, dist, gr0_k, gr1_k = grad_rect_torus(
-                params[i], params[j], d, alpha, r0, r1, eps, theta
-            )
+            if use_rect:
+                g0, g1, dist, gr0_k, gr1_k = rect_grad(
+                    params[i], params[j], d, alpha, r0, r1, eps
+                )
+                gr0_sum += gr0_k
+                gr1_sum += gr1_k
+            else:
+                g0, g1, dist, ga, gb = parallelogram_grad(
+                    params[i], params[j], d, alpha, x, y, eps
+                )
+                gx_sum += ga
+                gy_sum += gb
 
             params[i, 0] -= step_pos * g0
             params[i, 1] -= step_pos * g1
@@ -359,8 +387,6 @@ def _run_pair_sequence_online_njit(
 
             num += d * dist
             den += dist * dist
-            gr0_sum += gr0_k
-            gr1_sum += gr1_k
 
         params %= 1.0
 
@@ -388,8 +414,13 @@ def _run_pair_sequence_online_njit(
                     log_aspect = 6.0
                 r0 = np.exp(-0.5 * log_aspect)
                 r1 = np.exp(0.5 * log_aspect)
+            elif learn_mode >= 5:
+                alpha, x, y, y_raw = _update_parallelogram_geom(
+                    params, learn_mode, num, den, gx_sum, gy_sum, used,
+                    alpha, x, y, y_raw, alpha_ema, alpha_min, alpha_max, geom_lr, eps,
+                )
 
-    return params, alpha, r0, r1
+    return params, alpha, r0, r1, x, y
 
 
 def sgd_minibatch_njit(
@@ -405,20 +436,20 @@ def sgd_minibatch_njit(
     alpha_max=1e6,
     r0_init=1.0,
     r1_init=1.0,
-    learn_mode=0,   # 0=fixed, 1=alpha, 2=square, 3=rectangular, 4=alpha_aspect
+    learn_mode=0,   # 0=fixed,1=alpha,2=square,3=rectangular,4=alpha_aspect,5=rhombic,6=parallelogram
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
+    x_init=0.0,
+    y_init=1.0,
     chunk_epochs=DEFAULT_SEQUENCE_CHUNK_EPOCHS,
-    lr_warmup_init=10.0,
-    lr_warmup_decay=25.0,
 ):
     """
     Minibatch SGD for torus MDS using online updates over unique sampled pairs.
 
     This replaces the older with-replacement pair sampling
 
-    Returns: (params, alpha, r0, r1)
+    Returns: (params, alpha, r0, r1, x, y)
     """
     data = np.asarray(data, dtype=np.float64)
     n = data.shape[0]
@@ -426,8 +457,10 @@ def sgd_minibatch_njit(
     alpha = float(alpha_init)
     r0 = float(r0_init)
     r1 = float(r1_init)
+    x = float(x_init)
+    y = float(y_init)
     if max_iters <= 0 or n < 2:
-        return params, alpha, r0, r1
+        return params, alpha, r0, r1, x, y
 
     rng = np.random.default_rng(seed)
     pairs = _all_unique_pairs(n)
@@ -435,7 +468,7 @@ def sgd_minibatch_njit(
     while start_iter < max_iters:
         epochs = min(chunk_epochs, max_iters - start_iter)
         sequence = _build_sampled_unique_pair_sequence_from_pairs(pairs, rng, epochs, batch_pairs)
-        params, alpha, r0, r1 = _run_pair_sequence_online_njit(
+        params, alpha, r0, r1, x, y = _run_pair_sequence_online_njit(
             data=data,
             pair_sequence=sequence,
             learning_rate=learning_rate,
@@ -452,11 +485,11 @@ def sgd_minibatch_njit(
             geom_lr=geom_lr,
             geom_min=geom_min,
             theta=theta,
-            lr_warmup_init=lr_warmup_init,
-            lr_warmup_decay=lr_warmup_decay,
+            x_init=x,
+            y_init=y,
         )
         start_iter += epochs
-    return params, alpha, r0, r1
+    return params, alpha, r0, r1, x, y
 
 
 @dataclass
@@ -480,7 +513,6 @@ class TorusProjector:
     alpha_: Optional[float] = field(default=None, init=False)
     r0_: Optional[float] = field(default=None, init=False)
     r1_: Optional[float] = field(default=None, init=False)
-    actual_epochs_: Optional[int] = field(default=None, init=False)
 
     def fit_transform(self, D: np.ndarray, **kwargs) -> np.ndarray:
         D = _check_distance_matrix(D)
@@ -519,159 +551,104 @@ class MDSTorusProjector(TorusProjector):
 
     def stochastic_gradient_descent(
             self,
-            max_iters=None,
+            max_iters=10000,
             batch_size=4096,
             data=None,
             seed=0,
             alpha_init=1.0,
             r0_init=1.0,
             r1_init=1.0,
-            learn_mode='alpha',   # 'fixed' | 'alpha' | 'square' | 'rectangular' | 'alpha_aspect'
+            learn_mode='alpha',   # 'fixed'|'alpha'|'square'|'rectangular'|'alpha_aspect'|'rhombic'|'parallelogram'
             geom_lr=0.01,
             sampled_unique=True,
             theta=90.0,           # torus angle in degrees; must be in [60, 120]
-            # --- new sampling strategies ---
-            vertex_k: int = 0,    # >0: sample k partners per node per epoch
-            node_k: int = 0,      # >0: sample node_k nodes, pair into node_k//2 disjoint pairs
-            batch_fraction='sqrt_pairs',  # None | float | 'sqrt_n' | 'sqrt_pairs' — scales pair batch
-            # --- early stopping ---
-            tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
-            patience: int = 5,    # non-improving chunks before stopping
-            chunk_epochs: int = DEFAULT_SEQUENCE_CHUNK_EPOCHS,
-            # --- position step-size schedule ---
-            lr_warmup_init: float = 10.0,   # extra step size at epoch 0, decays away
-            lr_warmup_decay: float = 25.0,  # e-folding scale (epochs) of the warmup
+            x_init=None,          # initial shear (parallelogram/rhombic); default derived from theta
+            y_init=None,          # initial height (parallelogram)
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
-        if theta != 90.0 and not np.isclose(r0_init, r1_init):
-            raise ValueError("theta != 90 requires equal side lengths: set r0_init == r1_init or use theta=90 for a rectangular torus")
-        if theta != 90.0 and learn_mode in ('rectangular', 'alpha_aspect'):
-            raise ValueError("theta != 90 requires equal side lengths; use learn_mode='fixed', 'alpha', or 'square'")
+        mode_int = {
+            'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3,
+            'alpha_aspect': 4, 'rhombic': 5, 'parallelogram': 6,
+        }[learn_mode]
+
+        # Modes 0-4 use the rect kernel, exact only for rectangular or equal-side
+        # rhombic bases. At theta != 90, 'fixed' and 'alpha' are fine as a fixed-angle
+        # rhombic torus (equal sides required); 'square'/'rectangular'/'alpha_aspect'
+        # contradict a non-rectangular rhombus and are redirected to the dedicated
+        # parallelogram modes (5, 6).
+        if theta != 90.0:
+            if mode_int in (2, 3, 4):
+                raise ValueError(
+                    f"learn_mode={learn_mode!r} does not support theta != 90 "
+                    "(non-rectangular). Use learn_mode='rhombic' to learn the angle, "
+                    "'parallelogram' for a general shape, or 'alpha'/'fixed' with "
+                    "r0_init == r1_init for a fixed-angle rhombic torus."
+                )
+            if mode_int in (0, 1) and not np.isclose(r0_init, r1_init):
+                raise ValueError(
+                    "theta != 90 with learn_mode='fixed'/'alpha' requires equal side "
+                    "lengths (set r0_init == r1_init) for an exact rhombic torus."
+                )
         theta_rad = float(np.radians(theta))
-        mode_int = {'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3, 'alpha_aspect': 4}[learn_mode]
 
-        data = np.asarray(data, dtype=np.float64)
-        n = data.shape[0]
-        params = np.random.RandomState(seed).rand(n, 2).astype(np.float64, copy=False)
-        alpha = float(alpha_init)
-        r0 = float(r0_init)
-        r1 = float(r1_init)
+        # Legacy 'fixed'/'alpha' at theta != 90 is an equal-side rhombic torus; it now
+        # runs on the parallelogram kernel (rect_grad is orthogonal only). The (x, y)
+        # unit-circle basis carries no side length, so the fixed side length r0_init is
+        # folded into the parallelogram scale here and unfolded out of alpha_ on report.
+        non_orth_rect = mode_int in (0, 1) and theta != 90.0
 
-        if max_iters is None:
-            if sampled_unique and vertex_k == 0 and node_k == 0 and n >= 2:
-                resolved_batch = _resolve_batch_pairs(n, batch_size, batch_fraction)
-                max_iters = max(1, round(DEFAULT_TARGET_PAIR_UPDATES / resolved_batch))
-            else:
-                max_iters = 10000
+        # Initial shear/height for the parallelogram modes (5, 6) and the legacy rhombic
+        # path. lengths_angle_to_xy returns the unit-circle (cos t, sin t) for equal sides.
+        if x_init is None or y_init is None:
+            _, x0, y0 = lengths_angle_to_xy(r0_init, r1_init, theta_rad)
+        else:
+            x0, y0 = float(x_init), float(y_init)
+        if mode_int == 5:
+            # rhombic: start on the unit circle (equal sides) at the given angle
+            x0, y0 = float(np.cos(theta_rad)), float(np.sin(theta_rad))
+        if mode_int == 6 and x_init is None and abs(x0) < 1e-6:
+            x0 = 0.05  # asymmetric init to escape the x -> -x (rectangular) saddle
 
-        if max_iters <= 0 or n < 2:
-            self.alpha_ = alpha
-            self.r0_ = r0
-            self.r1_ = r1
-            self.theta_ = theta_rad
-            self.actual_epochs_ = 0
-            return params
+        alpha_kernel = alpha_init * r0_init if non_orth_rect else alpha_init
 
-        # Legacy with-replacement path: no early stopping, kept for backward compatibility.
-        if not sampled_unique and vertex_k == 0 and node_k == 0:
-            params, alpha, r0, r1 = _sgd_minibatch_njit_legacy(
-                data=data,
-                learning_rate=self.learning_rate,
-                max_iters=max_iters,
-                batch_pairs=batch_size,
-                seed=seed,
-                alpha_init=alpha_init,
-                r0_init=r0_init,
-                r1_init=r1_init,
-                learn_mode=mode_int,
-                geom_lr=geom_lr,
-                theta=theta_rad,
-                lr_warmup_init=lr_warmup_init,
-                lr_warmup_decay=lr_warmup_decay,
-            )
+        if sampled_unique:
+            sgd_fn = sgd_minibatch_njit # sample pairs without replacement
+        else:
+            sgd_fn = _sgd_minibatch_njit_legacy # sample pairs with replacement
+
+        coords, alpha, r0, r1, x, y = sgd_fn(
+            data=data,
+            learning_rate=self.learning_rate,
+            max_iters=max_iters,
+            batch_pairs=batch_size,
+            seed=seed,
+            alpha_init=alpha_kernel,
+            r0_init=r0_init,
+            r1_init=r1_init,
+            learn_mode=mode_int,
+            geom_lr=geom_lr,
+            theta=theta_rad,
+            x_init=x0,
+            y_init=y0,
+        )
+
+        if mode_int >= 5:
+            # Report learned (alpha, x, y) as side lengths + angle; the b0 length
+            # lives in alpha_, so r0_ = 1 and r1_ = |b1| / |b0|.
             self.alpha_ = float(alpha)
+            self.x_ = float(x)
+            self.y_ = float(y)
+            self.r0_, self.r1_, self.theta_ = xy_to_lengths_angle(1.0, x, y)
+        else:
+            # Unfold the side length folded into the parallelogram scale for the legacy
+            # rhombic path; a no-op (divide by 1) for the orthogonal rect modes.
+            self.alpha_ = float(alpha) / r0_init if non_orth_rect else float(alpha)
             self.r0_ = float(r0)
             self.r1_ = float(r1)
             self.theta_ = theta_rad
-            self.actual_epochs_ = max_iters
-            return params
-
-        rng = np.random.default_rng(seed)
-
-        # Pre-compute pair pool and actual batch count for pair-sampling strategy.
-        all_pairs = None
-        actual_batch = None
-        if vertex_k == 0 and node_k == 0:
-            all_pairs = _all_unique_pairs(n)
-            actual_batch = _resolve_batch_pairs(n, batch_size, batch_fraction)
-
-        # Pre-sample a fixed set of pairs used for early-stopping stress evaluation.
-        stress_sample = None
-        if tol > 0.0:
-            num_pairs = n * (n - 1) // 2
-            n_stress = min(max(256, batch_size), num_pairs)
-            stress_pool = _all_unique_pairs(n)
-            idx = rng.choice(num_pairs, size=min(n_stress, num_pairs), replace=False)
-            stress_sample = stress_pool[idx].astype(np.int32)
-
-        start_iter = 0
-        bad_chunks = 0
-        prev_stress = np.inf
-
-        while start_iter < max_iters:
-            epochs = min(chunk_epochs, max_iters - start_iter)
-
-            if vertex_k > 0:
-                sequence = _build_vertex_k_pair_sequence(n, vertex_k, rng, epochs)
-            elif node_k > 0:
-                sequence = _build_node_k_pair_sequence(n, node_k, rng, epochs)
-            else:
-                sequence = _build_sampled_unique_pair_sequence_from_pairs(
-                    all_pairs, rng, epochs, actual_batch
-                )
-
-            params, alpha, r0, r1 = _run_pair_sequence_online_njit(
-                data=data,
-                pair_sequence=sequence,
-                learning_rate=self.learning_rate,
-                init_params=params,
-                start_iter=start_iter,
-                alpha_init=alpha,
-                alpha_ema=0.05,
-                eps=1e-12,
-                alpha_min=1e-6,
-                alpha_max=1e6,
-                r0_init=r0,
-                r1_init=r1,
-                learn_mode=mode_int,
-                geom_lr=geom_lr,
-                geom_min=1e-6,
-                theta=theta_rad,
-                lr_warmup_init=lr_warmup_init,
-                lr_warmup_decay=lr_warmup_decay,
-            )
-            start_iter += epochs
-
-            if tol > 0.0:
-                curr_stress = _batch_stress_njit(
-                    data, params, stress_sample, alpha, r0, r1, theta_rad
-                )
-                rel_change = abs(prev_stress - curr_stress) / max(prev_stress, 1e-12)
-                if rel_change < tol:
-                    bad_chunks += 1
-                    if bad_chunks >= patience:
-                        break
-                else:
-                    bad_chunks = 0
-                prev_stress = curr_stress
-
-        self.alpha_ = float(alpha)
-        self.r0_ = float(r0)
-        self.r1_ = float(r1)
-        self.theta_ = theta_rad
-        self.actual_epochs_ = start_iter
-        return params
+            _, self.x_, self.y_ = lengths_angle_to_xy(r0, r1, theta_rad)
+        return coords
 
     def _embed(self, D: np.ndarray, **kwargs) -> np.ndarray:
         return self.stochastic_gradient_descent(data=D, **kwargs)

@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from . import graphio, metrics, visualization
-from .geometry import euclidean_grad, make_torus_geod, stress_and_grad_rect_torus
+from .geometry import euclidean_grad, make_torus_geod, rect_stress_and_grad
 from .projector import sgd_minibatch_njit
 
 
@@ -682,8 +682,8 @@ def _run_pair_sequence_online_njit(
             i = seq[k, 0]
             j = seq[k, 1]
             d = data[i, j]
-            _, grad, dist, gr0_k, gr1_k = stress_and_grad_rect_torus(
-                params[i], params[j], d, alpha, r0, r1, eps, theta
+            _, grad, dist, gr0_k, gr1_k = rect_stress_and_grad(
+                params[i], params[j], d, alpha, r0, r1, eps
             )
             params[i, 0] -= step_pos * grad[0]
             params[i, 1] -= step_pos * grad[1]
@@ -751,8 +751,8 @@ def _run_pair_sequence_sync_njit(
             i = seq[k, 0]
             j = seq[k, 1]
             d = data[i, j]
-            _, grad, dist, gr0_k, gr1_k = stress_and_grad_rect_torus(
-                params[i], params[j], d, alpha, r0, r1, eps, theta
+            _, grad, dist, gr0_k, gr1_k = rect_stress_and_grad(
+                params[i], params[j], d, alpha, r0, r1, eps
             )
             grad_acc[i, 0] += grad[0]
             grad_acc[i, 1] += grad[1]
@@ -1864,7 +1864,7 @@ def diagnose_torus_optimization(
                 i = int(seq[k, 0])
                 j = int(seq[k, 1])
                 d = float(data[i, j])
-                _, grad, dist, _, _ = stress_and_grad_rect_torus(params[i], params[j], d, alpha, r0, r1, 1e-12, theta)
+                _, grad, dist, _, _ = rect_stress_and_grad(params[i], params[j], d, alpha, r0, r1, 1e-12)
                 grad_norm = float(np.linalg.norm(grad))
                 pair_grad_norms[k] = grad_norm
                 counts[i] += 1
