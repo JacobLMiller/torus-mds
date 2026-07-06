@@ -10,6 +10,11 @@ from numba.typed import List as NumbaList
 from .geometry import grad_rect_torus, torus_grad, stress_and_grad_rect_torus
 
 DEFAULT_SEQUENCE_CHUNK_EPOCHS = 128
+# Old fixed defaults (max_iters=10000, batch capped at 4096) implied this many
+# total pair-updates; used to size max_iters when batch_fraction shrinks the
+# per-epoch batch below 4096, so smaller batches just run more epochs instead
+# of training on strictly less data.
+DEFAULT_TARGET_PAIR_UPDATES = 10000 * 4096
 
 
 def _check_distance_matrix(D: np.ndarray) -> np.ndarray:
@@ -174,6 +179,8 @@ def _sgd_minibatch_njit_legacy(
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
+    lr_warmup_init=10.0,
+    lr_warmup_decay=25.0,
 ):
     """
     Minibatch SGD for torus MDS on a flat rectangular/rhombic torus.
@@ -182,6 +189,12 @@ def _sgd_minibatch_njit_legacy(
     learn_mode=1 ('alpha'):    positions + alpha via closed-form batch minimiser + EMA.
     learn_mode=2 ('square'):   positions + shared r = r0 = r1 via SGD; alpha fixed.
     learn_mode=3 ('rectangular'): positions + independent r0, r1 via SGD; alpha fixed.
+
+    Position step size follows an exponentially-decaying warmup on top of the
+    harmonic tail: step = lr_warmup_init * exp(-it/lr_warmup_decay) + 1/(learning_rate+it),
+    floored at 1e-4. The warmup term vanishes after a few multiples of
+    lr_warmup_decay, leaving the plain harmonic decay of the tail. Set
+    lr_warmup_init=0 to recover the old pure-harmonic schedule.
 
     Returns: (params, alpha, r0, r1)
     """
@@ -206,7 +219,10 @@ def _sgd_minibatch_njit_legacy(
         log_aspect = 0.0
 
     for it in range(max_iters):
-        step_pos = max(1.0 / (learning_rate + it), 1e-4)
+        step_pos = max(
+            lr_warmup_init * np.exp(-it / lr_warmup_decay) + 1.0 / (learning_rate + it),
+            1e-4,
+        )
         if learn_mode == 4:
             r0 = np.exp(-0.5 * log_aspect)
             r1 = np.exp(0.5 * log_aspect)
@@ -289,6 +305,8 @@ def _run_pair_sequence_online_njit(
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
+    lr_warmup_init=10.0,
+    lr_warmup_decay=25.0,
 ):
     params = init_params.copy()
     alpha = alpha_init
@@ -309,7 +327,11 @@ def _run_pair_sequence_online_njit(
     epochs = len(pair_sequence)
 
     for it in range(epochs):
-        step_pos = max(1.0 / (learning_rate + start_iter + it), 1e-4)
+        global_it = start_iter + it
+        step_pos = max(
+            lr_warmup_init * np.exp(-global_it / lr_warmup_decay) + 1.0 / (learning_rate + global_it),
+            1e-4,
+        )
         if learn_mode == 4:
             r0 = np.exp(-0.5 * log_aspect)
             r1 = np.exp(0.5 * log_aspect)
@@ -388,6 +410,8 @@ def sgd_minibatch_njit(
     geom_min=1e-6,
     theta=np.pi / 2,
     chunk_epochs=DEFAULT_SEQUENCE_CHUNK_EPOCHS,
+    lr_warmup_init=10.0,
+    lr_warmup_decay=25.0,
 ):
     """
     Minibatch SGD for torus MDS using online updates over unique sampled pairs.
@@ -428,6 +452,8 @@ def sgd_minibatch_njit(
             geom_lr=geom_lr,
             geom_min=geom_min,
             theta=theta,
+            lr_warmup_init=lr_warmup_init,
+            lr_warmup_decay=lr_warmup_decay,
         )
         start_iter += epochs
     return params, alpha, r0, r1
@@ -493,7 +519,7 @@ class MDSTorusProjector(TorusProjector):
 
     def stochastic_gradient_descent(
             self,
-            max_iters=10000,
+            max_iters=None,
             batch_size=4096,
             data=None,
             seed=0,
@@ -507,11 +533,14 @@ class MDSTorusProjector(TorusProjector):
             # --- new sampling strategies ---
             vertex_k: int = 0,    # >0: sample k partners per node per epoch
             node_k: int = 0,      # >0: sample node_k nodes, pair into node_k//2 disjoint pairs
-            batch_fraction=None,  # None | float | 'sqrt_n' | 'sqrt_pairs' — scales pair batch
+            batch_fraction='sqrt_pairs',  # None | float | 'sqrt_n' | 'sqrt_pairs' — scales pair batch
             # --- early stopping ---
             tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
             patience: int = 5,    # non-improving chunks before stopping
             chunk_epochs: int = DEFAULT_SEQUENCE_CHUNK_EPOCHS,
+            # --- position step-size schedule ---
+            lr_warmup_init: float = 10.0,   # extra step size at epoch 0, decays away
+            lr_warmup_decay: float = 25.0,  # e-folding scale (epochs) of the warmup
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
@@ -528,6 +557,13 @@ class MDSTorusProjector(TorusProjector):
         alpha = float(alpha_init)
         r0 = float(r0_init)
         r1 = float(r1_init)
+
+        if max_iters is None:
+            if sampled_unique and vertex_k == 0 and node_k == 0 and n >= 2:
+                resolved_batch = _resolve_batch_pairs(n, batch_size, batch_fraction)
+                max_iters = max(1, round(DEFAULT_TARGET_PAIR_UPDATES / resolved_batch))
+            else:
+                max_iters = 10000
 
         if max_iters <= 0 or n < 2:
             self.alpha_ = alpha
@@ -551,6 +587,8 @@ class MDSTorusProjector(TorusProjector):
                 learn_mode=mode_int,
                 geom_lr=geom_lr,
                 theta=theta_rad,
+                lr_warmup_init=lr_warmup_init,
+                lr_warmup_decay=lr_warmup_decay,
             )
             self.alpha_ = float(alpha)
             self.r0_ = float(r0)
@@ -610,6 +648,8 @@ class MDSTorusProjector(TorusProjector):
                 geom_lr=geom_lr,
                 geom_min=1e-6,
                 theta=theta_rad,
+                lr_warmup_init=lr_warmup_init,
+                lr_warmup_decay=lr_warmup_decay,
             )
             start_iter += epochs
 
