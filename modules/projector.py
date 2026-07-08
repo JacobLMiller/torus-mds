@@ -111,7 +111,7 @@ def _sgd_minibatch_njit_legacy(
         log_aspect = 0.0
 
     for it in range(max_iters):
-        step_pos = max(1.0 / (learning_rate + it), 1e-4)
+        step_pos = max(learning_rate / (1.0 + it), 1e-4)
         if learn_mode == 4:
             r0 = np.exp(-0.5 * log_aspect)
             r1 = np.exp(0.5 * log_aspect)
@@ -181,7 +181,7 @@ def _run_pair_sequence_online_njit(
     data,
     pair_sequence,
     learning_rate,
-    init_params,
+    init,
     start_iter=0,
     alpha_init=1.0,
     alpha_ema=0.05,
@@ -195,7 +195,7 @@ def _run_pair_sequence_online_njit(
     geom_min=1e-6,
     theta=np.pi / 2,
 ):
-    params = init_params.copy()
+    params = init.copy()
     alpha = alpha_init
     r0 = r0_init
     r1 = r1_init
@@ -214,7 +214,7 @@ def _run_pair_sequence_online_njit(
     epochs = len(pair_sequence)
 
     for it in range(epochs):
-        step_pos = max(1.0 / (learning_rate + start_iter + it), 1e-4)
+        step_pos = max(learning_rate / (1.0 + start_iter + it), 1e-4)
         if learn_mode == 4:
             r0 = np.exp(-0.5 * log_aspect)
             r1 = np.exp(0.5 * log_aspect)
@@ -293,17 +293,26 @@ def sgd_minibatch_njit(
     geom_min=1e-6,
     theta=np.pi / 2,
     chunk_epochs=DEFAULT_SEQUENCE_CHUNK_EPOCHS,
+    init=None,
 ):
     """
     Minibatch SGD for torus MDS using online updates over unique sampled pairs.
 
     This replaces the older with-replacement pair sampling
 
+    init: optional (N, 2) initial positions; wrapped to [0,1). Random if None.
+
     Returns: (params, alpha, r0, r1)
     """
     data = np.asarray(data, dtype=np.float64)
     n = data.shape[0]
-    params = np.random.RandomState(seed).rand(n, 2).astype(np.float64, copy=False)
+    if init is None:
+        params = np.random.RandomState(seed).rand(n, 2).astype(np.float64, copy=False)
+    else:
+        init = np.asarray(init, dtype=np.float64)
+        if init.shape != (n, 2):
+            raise ValueError(f"init must have shape ({n}, 2), got {init.shape}.")
+        params = np.mod(init, 1.0)
     alpha = float(alpha_init)
     r0 = float(r0_init)
     r1 = float(r1_init)
@@ -320,7 +329,7 @@ def sgd_minibatch_njit(
             data=data,
             pair_sequence=sequence,
             learning_rate=learning_rate,
-            init_params=params,
+            init=params,
             start_iter=start_iter,
             alpha_init=alpha,
             alpha_ema=alpha_ema,
@@ -393,7 +402,11 @@ class TorusProjector:
 class MDSTorusProjector(TorusProjector):
     projection: Literal["wrap", "robust_wrap"] = "wrap"
 
-    learning_rate = 1
+    # learning_rate is the initial SGD step size; the step decays as
+    # learning_rate / (1 + epoch). higher learning_rate -> larger steps.
+    # the default 1.0 is above the stability threshold of the stress and partially
+    # scrambles a good init before re-converging; use ~0.1 to preserve inits.
+    learning_rate: float = 1
 
     def stochastic_gradient_descent(
             self,
@@ -408,6 +421,8 @@ class MDSTorusProjector(TorusProjector):
             geom_lr=0.01,
             sampled_unique=True,
             theta=90.0,           # torus angle in degrees; must be in [60, 120]
+            init=None,            # optional (N, 2) initial positions in [0,1)^2 or spectral initialization dict
+            learning_rate=None,   # overrides self.learning_rate; use ~0.1 with an init
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
@@ -418,14 +433,31 @@ class MDSTorusProjector(TorusProjector):
         theta_rad = float(np.radians(theta))
         mode_int = {'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3, 'alpha_aspect': 4}[learn_mode]
 
+        if isinstance(init, dict) and "fundamental_directions" in init:
+            dmax = float(np.asarray(data).max())
+            if not np.isclose(dmax, 1.0):
+                raise ValueError(
+                    "spectral-dict init assumes distances normalized to max 1 "
+                    f"(pass D / D.max()); got D.max()={dmax:.6g}."
+                )
+            from .initialization import rect_torus_init_from_spectral  # lazy: keeps scipy
+            init, r0_init, r1_init = rect_torus_init_from_spectral(init)  # out of import path
+            alpha_init = 1.0
+
+        if learning_rate is None:
+            learning_rate = self.learning_rate
+
         if sampled_unique:
             sgd_fn = sgd_minibatch_njit # sample pairs without replacement
         else:
+            if init is not None:
+                raise ValueError("init is only supported with sampled_unique=True")
             sgd_fn = _sgd_minibatch_njit_legacy # sample pairs with replacement
 
+        extra_kwargs = {} if init is None else {"init": init}
         coords, alpha, r0, r1 = sgd_fn(
             data=data,
-            learning_rate=self.learning_rate,
+            learning_rate=learning_rate,
             max_iters=max_iters,
             batch_pairs=batch_size,
             seed=seed,
@@ -435,6 +467,7 @@ class MDSTorusProjector(TorusProjector):
             learn_mode=mode_int,
             geom_lr=geom_lr,
             theta=theta_rad,
+            **extra_kwargs,
         )
         self.alpha_ = float(alpha)
         self.r0_ = float(r0)

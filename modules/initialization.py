@@ -122,6 +122,25 @@ def torus_init_from_eigenpairs(pair1, pair2):
     return np.column_stack([x, y])
 
 
+def rect_torus_init_from_spectral(result):
+    """Build a rectangular-torus init from a find_fundamental_torus_directions
+    result: layout coords in [0,1)^2 (phases) plus side lengths r0, r1 scaled so
+    the torus diameter 0.5*sqrt(r0^2 + r1^2) == 1, matching a distance matrix
+    normalized to max 1. The aspect ratio r1/r0 comes from the spectral side
+    lengths; their (bandwidth-dependent, unitless) absolute scale is discarded.
+
+    Returns (coords, r0, r1).
+    """
+    d = result["fundamental_directions"]
+    coords = torus_init_from_eigenpairs(d[0]["eigenvectors"], d[1]["eigenvectors"])
+    L0 = d[0]["side_length"]
+    L1 = d[1]["side_length"]
+    norm = np.sqrt(L0 ** 2 + L1 ** 2)
+    r0 = 2.0 * L0 / norm
+    r1 = 2.0 * L1 / norm      # 0.5*sqrt(r0^2+r1^2) == 1, aspect r1/r0 == L1/L0
+    return coords, float(r0), float(r1)
+
+
 def harmonic_score(z_candidate, z_reference, m):
     """
     Score whether candidate phase is approximately an m-th harmonic
