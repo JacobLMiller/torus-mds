@@ -3,6 +3,7 @@ from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import eigsh
 from scipy.linalg import expm
 from scipy.optimize import minimize
+import types
 
 
 def lowest_laplacian_eigenvalues(
@@ -445,3 +446,16 @@ def find_fundamental_torus_directions(
         ],
         "skipped_harmonics": skipped,
     }
+
+
+
+def _torus_geom_from_result(result):
+    """Build a minimal torus geometry object for plot_embedding_with_torus_edges."""
+    d = result["fundamental_directions"]
+    return types.SimpleNamespace(
+        torus_embedding_=torus_init_from_eigenpairs(d[0]["eigenvectors"], d[1]["eigenvectors"]),
+        alpha_=1.0,
+        r0_=d[0]["side_length"],
+        r1_=d[1]["side_length"],
+        theta_=np.pi / 2,
+    )
