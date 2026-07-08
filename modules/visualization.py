@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.collections import LineCollection
 
 
 from .geometry import torus_edge_segments
@@ -12,7 +13,7 @@ from .metrics import geodesic_matrix, subsample
 def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
                                    s=10, node_alpha=0.9,
                                    edge_alpha=0.10, edge_lw=0.4,
-                                   colors=None,
+                                   colors=None, cmap=None, vmin=None, vmax=None,
                                    torus=None,
                                    ax=None):
     """
@@ -52,20 +53,47 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
     if ax is None:
         fig, ax = plt.subplots()
 
-    # edges — segments computed in [0,1)^2, then mapped to physical space
-    for u, v in (G.edges() if G is not None else []):
-        i, j = idx[u], idx[v]
-        p, q = X[i], X[j]
-        for a, b in torus_edge_segments(p, q):
-            a_phys = M @ a
-            b_phys = M @ b
-            ax.plot([a_phys[0], b_phys[0]], [a_phys[1], b_phys[1]],
-                     color="k", alpha=edge_alpha, lw=edge_lw, zorder=1)
+    # edges — geodesic segments in [0,1)^2, split at torus-boundary crossings, mapped to
+    # physical space, drawn as one batched LineCollection (vectorized torus_edge_segments)
+    if G is not None and G.number_of_edges() > 0:
+        ij = np.array([(idx[u], idx[v]) for u, v in G.edges()])
+        p = X[ij[:, 0]]
+        q = X[ij[:, 1]]
+        d = ((q - p + 0.5) % 1.0) - 0.5          # shortest displacement per coordinate
+        r = p + d
+        E = len(p)
+        # boundary-crossing parameter t in [0,1] per axis (0 = no crossing -> degenerate piece)
+        cross = np.zeros((E, 2))
+        for kk in (0, 1):
+            up = (d[:, kk] > 0) & (r[:, kk] > 1.0)
+            dn = (d[:, kk] < 0) & (r[:, kk] < 0.0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                cross[up, kk] = np.clip(((1.0 - p[:, kk]) / d[:, kk])[up], 0.0, 1.0)
+                cross[dn, kk] = np.clip(((0.0 - p[:, kk]) / d[:, kk])[dn], 0.0, 1.0)
+        cross.sort(axis=1)
+        bp = np.concatenate([np.zeros((E, 1)), cross, np.ones((E, 1))], axis=1)  # breakpoints
+        segs = []
+        for a_t, b_t in ((0, 1), (1, 2), (2, 3)):
+            t0, t1 = bp[:, a_t], bp[:, b_t]
+            keep = (t1 - t0) > 1e-9              # drop degenerate pieces
+            if not keep.any():
+                continue
+            a = p[keep] + t0[keep, None] * d[keep]
+            b = p[keep] + t1[keep, None] * d[keep]
+            tile = np.floor(0.5 * (a + b))       # shift each piece into the fundamental domain
+            a = np.clip(a - tile, 0.0, 1.0) @ M.T
+            b = np.clip(b - tile, 0.0, 1.0) @ M.T
+            segs.append(np.stack([a, b], axis=1))
+        if segs:
+            ax.add_collection(LineCollection(np.concatenate(segs, axis=0), colors="k",
+                                             alpha=edge_alpha, linewidths=edge_lw, zorder=1))
 
-    # points
+    # points. Pass scalar `colors` with a `cmap` (not pre-mapped RGBA) so the
+    # returned PathCollection is a proper ScalarMappable and plt.colorbar works.
     X_phys = X @ M.T
     ax.scatter(X_phys[:, 0], X_phys[:, 1], s=s, alpha=node_alpha, zorder=2,
-               c=colors if colors is not None else "blue")
+               c=colors if colors is not None else "blue",
+               cmap=cmap, vmin=vmin, vmax=vmax)
 
     # parallelogram boundary of the fundamental domain
     corners = np.array([[0, 0], [1, 0], [1, 1], [0, 1]]) @ M.T
