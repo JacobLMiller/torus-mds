@@ -8,6 +8,7 @@
 *.gv
 *.npz
 *.csv
+poster/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
