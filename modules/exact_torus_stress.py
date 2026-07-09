@@ -275,6 +275,35 @@ def _evaluate_profiled_njit(
     return F, grad_y, grad_shape, alpha, stress_sq, A, B
 
 
+@numba.njit(cache=True, fastmath=True)
+def _evaluate_fixed_alpha_stress_njit(
+    y,
+    pair_i,
+    pair_j,
+    d,
+    w,
+    Dsum,
+    alpha,
+    embedding,
+    r0,
+    r1,
+    theta,
+    eps_q,
+):
+    c = np.cos(theta)
+    g00 = r0 * r0
+    g01 = r0 * r1 * c
+    g11 = r1 * r1
+
+    num = 0.0
+    for k in range(d.shape[0]):
+        _u, _v, h = _selected_pair_terms_njit(y, pair_i[k], pair_j[k], g00, g01, g11, embedding)
+        q = np.sqrt(h + eps_q * eps_q)
+        residual = alpha * q - d[k]
+        num += w[k] * residual * residual
+    return np.sqrt(num / Dsum)
+
+
 def _evaluate_general_objective_and_gradient(
     y: np.ndarray,
     shape_vars: np.ndarray,
@@ -343,6 +372,44 @@ def evaluate_profiled_objective_and_gradient(
     )
     grad_s = float(grad_shape[0]) if grad_shape.size else 0.0
     return F, grad_y, grad_s, alpha, stress_sq, A, B
+
+
+def evaluate_torus_stress(
+    y: np.ndarray,
+    distances: np.ndarray,
+    *,
+    alpha: float = 1.0,
+    r0: float = 1.0,
+    r1: float = 1.0,
+    theta: float = float(np.pi / 2),
+    weights: Optional[np.ndarray] = None,
+    embedding: EmbeddingMode = "torus",
+    eps_q: float = 0.0,
+) -> float:
+    """Evaluate fixed-alpha normalized stress with the fast pairwise torus kernel."""
+    yy = _normalize_layout(y, embedding)
+    pair_data = prepare_pair_data(distances, weights)
+    if yy.shape != (pair_data.n, 2):
+        raise ValueError(f"y must have shape {(pair_data.n, 2)}, got {yy.shape}.")
+    if embedding == "euclidean" and abs(np.cos(theta)) > 1e-12:
+        raise ValueError("Non-rectangular fixed-alpha stress is only supported for torus embeddings.")
+    embedding_int = 0 if embedding == "torus" else 1
+    return float(
+        _evaluate_fixed_alpha_stress_njit(
+            yy,
+            pair_data.i,
+            pair_data.j,
+            pair_data.d,
+            pair_data.w,
+            pair_data.Dsum,
+            float(alpha),
+            embedding_int,
+            float(r0),
+            float(r1),
+            float(theta),
+            float(eps_q),
+        )
+    )
 
 
 def _pack(y: np.ndarray, shape_vars: np.ndarray) -> np.ndarray:
@@ -439,11 +506,11 @@ def polish_torus_layout(
     theta: float = float(np.pi / 2),
     x0: float = 0.0,
     y0_shape: float = 1.0,
-    max_iter: int = 200,
+    max_iter: int = 50,
     eps_q: float = 1e-12,
     s_bounds: tuple[float, float] = (-10.0, 10.0),
-    ftol: float = 1e-12,
-    gtol: float = 1e-9,
+    ftol: float = 1e-9,
+    gtol: float = 1e-7,
     maxls: int = 80,
 ) -> TorusPolishResult:
     """Polish an existing layout with exact profiled L-BFGS.

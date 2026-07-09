@@ -55,8 +55,8 @@ def _all_unique_pairs(n: int) -> np.ndarray:
 def _lbfgs_polish_options(finalize_iters: int, finalize_options: Optional[dict]) -> dict:
     opts = {
         "max_iter": int(finalize_iters),
-        "ftol": 1e-12,
-        "gtol": 1e-9,
+        "ftol": 1e-9,
+        "gtol": 1e-7,
         "maxls": 80,
     }
     if finalize_options:
@@ -670,7 +670,7 @@ class MDSTorusProjector(TorusProjector):
             tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
             patience: int = 5,    # non-improving chunks before stopping
             finalize: Literal[None, "none", "lbfgs"] = None,
-            finalize_iters: int = 200,
+            finalize_iters: int = 50,
             finalize_options: Optional[dict] = None,
     ):
         if not (60.0 <= theta <= 120.0):
