@@ -52,6 +52,36 @@ def _all_unique_pairs(n: int) -> np.ndarray:
     return np.column_stack([ii, jj]).astype(np.int32, copy=False)
 
 
+def _lbfgs_polish_options(finalize_iters: int, finalize_options: Optional[dict]) -> dict:
+    opts = {
+        "max_iter": int(finalize_iters),
+        "ftol": 1e-12,
+        "gtol": 1e-9,
+        "maxls": 80,
+    }
+    if finalize_options:
+        opts.update(finalize_options)
+    return opts
+
+
+def _polish_shape_kwargs(mode_int: int, r0: float, r1: float, x: float, y: float, theta: float) -> dict:
+    if mode_int in (3, 4):
+        return {
+            "shape_mode": "rectangular",
+            "s0": float(np.log(max(r0, 1e-300) / max(r1, 1e-300))),
+        }
+    if mode_int == 5:
+        return {"shape_mode": "rhombic", "x0": float(x), "y0_shape": float(y)}
+    if mode_int == 6:
+        return {"shape_mode": "parallelogram", "x0": float(x), "y0_shape": float(y)}
+    return {
+        "shape_mode": "fixed",
+        "r0": float(r0),
+        "r1": float(r1),
+        "theta": float(theta),
+    }
+
+
 def _build_sampled_unique_pair_sequence_from_pairs(
     pairs: np.ndarray,
     rng: np.random.Generator,
@@ -578,6 +608,10 @@ class TorusProjector:
     alpha_: Optional[float] = field(default=None, init=False)
     r0_: Optional[float] = field(default=None, init=False)
     r1_: Optional[float] = field(default=None, init=False)
+    theta_: Optional[float] = field(default=None, init=False)
+    x_: Optional[float] = field(default=None, init=False)
+    y_: Optional[float] = field(default=None, init=False)
+    finalization_info_: dict = field(default_factory=lambda: {"mode": None}, init=False)
 
     def fit_transform(self, D: np.ndarray, **kwargs) -> np.ndarray:
         D = _check_distance_matrix(D)
@@ -635,6 +669,9 @@ class MDSTorusProjector(TorusProjector):
             # --- convergence criteria (sampled_unique path only) ---
             tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
             patience: int = 5,    # non-improving chunks before stopping
+            finalize: Literal[None, "none", "lbfgs"] = None,
+            finalize_iters: int = 200,
+            finalize_options: Optional[dict] = None,
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
@@ -652,7 +689,7 @@ class MDSTorusProjector(TorusProjector):
             if mode_int in (2, 3, 4):
                 raise ValueError(
                     f"learn_mode={learn_mode!r} does not support theta != 90 "
-                    "(non-rectangular). Use learn_mode='rhombic' to learn the angle, "
+                    "(non-rectangular). use learn_mode='rhombic' to learn the angle, "
                     "'parallelogram' for a general shape, or 'alpha'/'fixed' with "
                     "r0_init == r1_init for a fixed-angle rhombic torus."
                 )
@@ -709,6 +746,29 @@ class MDSTorusProjector(TorusProjector):
 
         coords, alpha, r0, r1, x, y = sgd_fn(**kwargs)
 
+        final_info = {"mode": None}
+        if finalize in (None, "none"):
+            pass
+        elif finalize == "lbfgs":
+            from .exact_torus_stress import polish_torus_layout
+
+            result = polish_torus_layout(
+                coords,
+                data,
+                **_polish_shape_kwargs(mode_int, r0, r1, x, y, theta_rad),
+                **_lbfgs_polish_options(finalize_iters, finalize_options),
+            )
+            coords = result.y
+            alpha = result.alpha
+            r0 = result.r0
+            r1 = result.r1
+            x = result.x
+            y = result.y_shape
+            theta_rad = result.theta
+            final_info = {"mode": "lbfgs", **result.convergence_info, "n_iter": result.n_iter}
+        else:
+            raise ValueError("finalize must be None, 'none', or 'lbfgs'")
+
         if mode_int >= 5:
             # Report learned (alpha, x, y) as side lengths + angle; the b0 length
             # lives in alpha_, so r0_ = 1 and r1_ = |b1| / |b0|.
@@ -719,11 +779,12 @@ class MDSTorusProjector(TorusProjector):
         else:
             # Unfold the side length folded into the parallelogram scale for the legacy
             # rhombic path; a no-op (divide by 1) for the orthogonal rect modes.
-            self.alpha_ = float(alpha) / r0_init if non_orth_rect else float(alpha)
+            self.alpha_ = float(alpha) / r0_init if non_orth_rect and final_info["mode"] is None else float(alpha)
             self.r0_ = float(r0)
             self.r1_ = float(r1)
             self.theta_ = theta_rad
             _, self.x_, self.y_ = lengths_angle_to_xy(r0, r1, theta_rad)
+        self.finalization_info_ = final_info
         return coords
 
     def _embed(self, D: np.ndarray, **kwargs) -> np.ndarray:

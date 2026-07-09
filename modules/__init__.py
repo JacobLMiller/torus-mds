@@ -23,6 +23,11 @@ from .projector import (
     TSNETorusProjector,
     UMAPTorusProjector,
 )
+from .exact_torus_stress import (
+    prepare_pair_data,
+    evaluate_profiled_objective_and_gradient,
+    polish_torus_layout,
+)
 from .metrics import (
     subsample,
     geodesic_matrix,
