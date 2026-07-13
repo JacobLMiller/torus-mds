@@ -57,8 +57,6 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
 
     if ax is None:
         fig, ax = plt.subplots()
-    # edges — segments computed in [0,1)^2, then mapped to physical space
-
     # edges — geodesic segments in [0,1)^2, split at torus-boundary crossings, mapped to
     # physical space, drawn as one batched LineCollection (vectorized torus_edge_segments)
     if G is not None and G.number_of_edges() > 0:

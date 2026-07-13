@@ -655,10 +655,8 @@ class TorusProjector:
 class MDSTorusProjector(TorusProjector):
     projection: Literal["wrap", "robust_wrap"] = "wrap"
 
-    # learning_rate is the initial SGD step size; the step decays as
-    # learning_rate / (1 + epoch). higher learning_rate -> larger steps.
-    # the default 1.0 is above the stability threshold of the stress and partially
-    # scrambles a good init before re-converging; use ~0.1 to preserve inits.
+    # In the current schedule, larger learning_rate means smaller harmonic-tail
+    # steps: step_tail = 1 / (learning_rate + epoch).
     learning_rate: float = 1
 
     def stochastic_gradient_descent(
@@ -675,11 +673,11 @@ class MDSTorusProjector(TorusProjector):
             sampled_unique=True,
             theta=90.0,           # torus angle in degrees; must be in [60, 120]
             init=None,            # optional (N, 2) initial positions in [0,1)^2 or spectral initialization dict
-            learning_rate=None,   # overrides self.learning_rate for this fit
+            learning_rate: float | Literal["auto"] | None = "auto",
             x_init=None,          # initial shear (parallelogram/rhombic); default derived from theta
             y_init=None,          # initial height (parallelogram)
             # --- position step-size schedule ---
-            lr_warmup_init: float = 10.0,   # extra step size at epoch 0, decays away
+            lr_warmup_init: float | Literal["auto"] | None = "auto",
             lr_warmup_decay: float = 25.0,  # e-folding scale (epochs) of the warmup
             # --- convergence criteria (sampled_unique path only) ---
             tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
@@ -690,6 +688,7 @@ class MDSTorusProjector(TorusProjector):
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
+        has_init = init is not None
         mode_int = {
             'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3,
             'alpha_aspect': 4, 'rhombic': 5, 'parallelogram': 6,
@@ -726,8 +725,23 @@ class MDSTorusProjector(TorusProjector):
             init, r0_init, r1_init = rect_torus_init_from_spectral(init)
             alpha_init = 1.0
 
-        if learning_rate is None:
-            learning_rate = self.learning_rate
+        if learning_rate is None or learning_rate == "auto":
+            # Random starts benefit from the exploratory main-branch schedule.
+            # Supplied inits are already structured; preserve them with the old
+            # spectral-init-sized first tail step: 1 / 10 == 0.1.
+            learning_rate = 10.0 if has_init else self.learning_rate
+        elif isinstance(learning_rate, str):
+            raise ValueError(f"learning_rate must be 'auto' or positive, got {learning_rate!r}")
+        if lr_warmup_init is None or lr_warmup_init == "auto":
+            lr_warmup_init = 0.0 if has_init else 10.0
+        elif isinstance(lr_warmup_init, str):
+            raise ValueError(f"lr_warmup_init must be 'auto' or non-negative, got {lr_warmup_init!r}")
+        if learning_rate <= 0:
+            raise ValueError(f"learning_rate must be positive, got {learning_rate}")
+        if lr_warmup_init < 0:
+            raise ValueError(f"lr_warmup_init must be non-negative, got {lr_warmup_init}")
+        if lr_warmup_decay <= 0:
+            raise ValueError(f"lr_warmup_decay must be positive, got {lr_warmup_decay}")
 
         # Legacy 'fixed'/'alpha' at theta != 90 is an equal-side rhombic torus; it now
         # runs on the parallelogram kernel (rect_grad is orthogonal only). The (x, y)
