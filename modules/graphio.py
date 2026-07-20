@@ -29,8 +29,11 @@ def apsp_distance_matrix(G: nx.Graph, weight: str = "weight",
     nodes = list(G.nodes())
 
     if method == "scipy":
-        # nodelist fixes row/col order to `nodes`, matching the networkx branch.
-        A = nx.to_scipy_sparse_array(G, nodelist=nodes, weight=weight)
+        # need to make sure dtype is consistent.
+        A = nx.to_scipy_sparse_array(G, nodelist=nodes, weight=weight, dtype=np.float64)
+        # my version needs epxlicity int32
+        A.indices = A.indices.astype(np.int32, copy=False)
+        A.indptr = A.indptr.astype(np.int32, copy=False)
         D = dijkstra(A, directed=False)
         return D, nodes
 
