@@ -59,7 +59,10 @@ if __name__ == "__main__":
     parser.add_argument("--num-shards", type=int, default=1,
                         help="Total number of shards (default: 1, i.e. no sharding)")
     parser.add_argument("--torus-max-iters", type=int, default=2000,
-                        help="SGD/descent iterations for TorusMDS and wrap_python (default: 2000)")
+                        help="SGD iterations for TorusMDS (default: 2000)")
+    parser.add_argument("--wrap-python-max-iters", type=int, default=200,
+                        help="Descent iterations for wrap_python -- kept low since its cost is "
+                             "O(n^2 * iters); 200 matches the Chen reference's own default (default: 200)")
     parser.add_argument("--wrap-python-max-n", type=int, default=3500,
                         help="Max n for the Chen wrap_python method; skipped above this (default: 3500)")
     parser.add_argument("--output-dir", type=str, default="layouts/suitesparse",
@@ -83,6 +86,7 @@ if __name__ == "__main__":
         graph_iterator=graph_iterator,
         output_dir=args.output_dir,
         torus_max_iters=args.torus_max_iters,
+        wrap_python_max_iters=args.wrap_python_max_iters,
         method_max_n={"wrap_python": args.wrap_python_max_n},
         checkpoint_every=args.checkpoint_every,
         seed=args.seed,

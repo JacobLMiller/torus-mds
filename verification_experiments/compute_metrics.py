@@ -38,35 +38,38 @@ from modules.metrics import SGS, estimate_alpha, geodesic_distortion, geodesic_N
 _MANIFEST_ONLY_COLUMNS = {"status", "alpha_fit", "seed"}
 
 
-def compute_metrics(
-    X: np.ndarray,
-    D: np.ndarray,
-    geod,
-    max_n: int = 100,
-    rg: float = 2.0,
-) -> dict:
-    """Compute all four metrics from metrics.py, subsampling to max_n nodes if needed."""
-    if X.shape[0] > max_n:
-        rng_sub = np.random.default_rng(42)
-        idx = rng_sub.choice(X.shape[0], max_n, replace=False)
-        X_s = X[idx]
-        D_s = D[np.ix_(idx, idx)]
-    else:
-        X_s, D_s = X, D
+def _subsample(X: np.ndarray, D: np.ndarray, max_n: int, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
+    """Uniformly subsample to at most max_n nodes, keeping X and D in sync.
 
+    Same fixed seed regardless of method, so every method for a given graph
+    (same n) gets the identical subsample -- required for an apples-to-apples
+    comparison across methods.
+    """
+    if X.shape[0] <= max_n:
+        return X, D
+    rng_sub = np.random.default_rng(seed)
+    idx = rng_sub.choice(X.shape[0], max_n, replace=False)
+    return X[idx], D[np.ix_(idx, idx)]
+
+
+def compute_metrics(X: np.ndarray, D: np.ndarray, geod, rg: float = 2.0) -> dict:
+    """Compute all four metrics from metrics.py on the given (already max_n-sized) layout/distances."""
     return dict(
-        stress=geodesic_stress(X_s, D_s, geod),
-        distortion=geodesic_distortion(X_s, D_s, geod),
-        sgs=SGS(X_s, D_s, geod),
-        np_score=geodesic_NP(X_s, D_s, geod, rg=rg),
+        stress=geodesic_stress(X, D, geod),
+        distortion=geodesic_distortion(X, D, geod),
+        sgs=SGS(X, D, geod),
+        np_score=geodesic_NP(X, D, geod, rg=rg),
     )
 
 
 def _geod_for(method: str, X: np.ndarray, D: np.ndarray):
     if method == "s_gd2":
         return euc_distance, float("nan")
-    # TorusMDS / wrap_python: re-estimate scale on the loaded layout, as the
-    # original scripts did, rather than trusting the embedding-phase alpha_fit.
+    # TorusMDS / wrap_python: re-estimate scale on the same (already
+    # subsampled) points used for the metrics below, not the full graph --
+    # estimate_alpha is an unvectorized O(k^2) Python loop (like every other
+    # metric here), and at n=10,000 that's ~50M Python-level calls if run on
+    # the full graph instead of the subsample.
     alpha = estimate_alpha(X, D)
     return (lambda p, q, a=alpha: a * torus_distance(p, q)), alpha
 
@@ -120,8 +123,9 @@ def run_metrics(
             meta = {k: v for k, v in row.items() if k not in _MANIFEST_ONLY_COLUMNS}
             try:
                 X = np.load(coords_path(layouts_dir, int(exp_idx), method))
-                geod, alpha = _geod_for(method, X, D)
-                metrics = compute_metrics(X, D, geod, max_n=metric_subsample, rg=np_radius)
+                X_s, D_s = _subsample(X, D, metric_subsample)
+                geod, alpha = _geod_for(method, X_s, D_s)
+                metrics = compute_metrics(X_s, D_s, geod, rg=np_radius)
                 records.append({**meta, "t_spd": round(t_spd, 4), **metrics, "alpha": round(alpha, 6) if np.isfinite(alpha) else alpha})
                 done.add((int(exp_idx), method))
             except Exception:

@@ -118,6 +118,7 @@ def run_embeddings(
     graph_iterator: Iterable[GraphRecord],
     output_dir: str,
     torus_max_iters: int = 2000,
+    wrap_python_max_iters: int = 200,
     method_max_n: dict[str, int | None] | None = None,
     checkpoint_every: int = 20,
     seed: int = 0,
@@ -174,7 +175,7 @@ def run_embeddings(
                     D, _ = apsp_distance_matrix(G)
                     X, alpha_fit = embed_torus_mds(D, max_iters=torus_max_iters, seed=seed)
                 elif method == "wrap_python":
-                    X = embed_wrap_python(G, max_iters=torus_max_iters, seed=seed)
+                    X = embed_wrap_python(G, max_iters=wrap_python_max_iters, seed=seed)
                     alpha_fit = float("nan")
                 else:
                     raise ValueError(f"Unknown method {method!r}")

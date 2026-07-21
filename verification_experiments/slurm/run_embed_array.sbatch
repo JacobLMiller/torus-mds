@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=torus-embed
-#SBATCH --partition=<FILL_IN>
-#SBATCH --account=<FILL_IN>
+#SBATCH --partition=compute
 #SBATCH --cpus-per-task=4
 #SBATCH --time=00:30:00
 #SBATCH --mem=4G
@@ -9,27 +8,17 @@
 #SBATCH --output=slurm_logs/embed_%x_%A_%a.out
 #SBATCH --error=slurm_logs/embed_%x_%A_%a.err
 #
-# Embedding phase: one array task = one shard of one graph family. TorusMDS
-# and s_gd2 are near-linear in n; wrap_python (Chen) is O(n^2 * max_iters)
-# and is capped via --wrap-python-max-n, so it's safe to run the same
-# template across all size tiers. No Node.js/npm setup is needed anywhere --
-# wrap_python() is a pure Python/numba port of the Chen algorithm, it does
-# not shell out to a Node subprocess.
+# --time=00:30:00 above is a placeholder, NOT a real budget -- you MUST
+# override it per submission (see README.md for measured per-tier values,
+# ranging ~20min to ~3hr). Embedding phase: one array task = one shard of
+# one graph family.
 #
-# Submit once per (family, size tier), overriding --time / --mem / --array
-# and passing family-specific settings via --export (command-line flags to
-# `sbatch` take precedence over the #SBATCH defaults above). See
-# verification_experiments/slurm/README.md for concrete example invocations
-# and recommended --time/--mem per tier.
+
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$REPO_ROOT"
-
-# --- environment setup: adjust to your cluster ---
-# module load <python module>
-# source activate torus-mds
+source "${MINIFORGE_ROOT:-$HOME/miniforge3}/etc/profile.d/conda.sh"
+conda activate torus-mds
 
 FAMILY="${FAMILY:?Set FAMILY=sbm|grg|suitesparse via --export}"
 SHARD="${SLURM_ARRAY_TASK_ID}"
