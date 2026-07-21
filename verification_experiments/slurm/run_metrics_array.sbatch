@@ -23,7 +23,7 @@ NP_RADIUS="${NP_RADIUS:-2.0}"
 
 mkdir -p results
 
-mapfile -t SHARD_DIRS < <(find "layouts/${FAMILY}" -mindepth 1 -name runs.csv -exec dirname {} \; | sort)
+mapfile -t SHARD_DIRS < <(find "layouts/${FAMILY}" -mindepth 1 -name runs.csv -exec dirname {} \; | sort -V)
 
 if [ "${#SHARD_DIRS[@]}" -eq 0 ]; then
   echo "No runs.csv found anywhere under layouts/${FAMILY} (resolved from REPO_ROOT=${REPO_ROOT}). Check: FAMILY is spelled right, this job was submitted from the repo root, and the corresponding run_embed_array.sbatch job(s) actually completed and wrote output there." >&2
