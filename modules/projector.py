@@ -99,7 +99,14 @@ def _build_sampled_unique_pair_sequence_from_pairs(
 
 @numba.njit(cache=True, fastmath=True)
 def _batch_stress_njit(data, params, pairs, alpha, r0, r1, x, y, use_rect, eps=1e-12):
-    """Normalised stress on a fixed pair sample: sum((alpha*r-d)^2) / sum(d^2)."""
+    """
+    Normalised stress on a fixed pair sample: sum((alpha*r-d)^2) / sum(d^2).
+
+    This is always the same summary metric, independent of whether raw or
+    normalized stress is being optimized (see ``normalize`` in rect_grad /
+    parallelogram_grad) -- it is only used as a relative-improvement signal for
+    the tol/patience early-stopping check, not as the training objective itself.
+    """
     total_loss = 0.0
     total_d2 = 0.0
     for k in range(pairs.shape[0]):
@@ -107,9 +114,9 @@ def _batch_stress_njit(data, params, pairs, alpha, r0, r1, x, y, use_rect, eps=1
         j = pairs[k, 1]
         d = data[i, j]
         if use_rect:
-            _, _, r, _, _ = rect_grad(params[i], params[j], d, alpha, r0, r1, eps)
+            _, _, r, _, _, _ = rect_grad(params[i], params[j], d, alpha, r0, r1, eps)
         else:
-            _, _, r, _, _ = parallelogram_grad(params[i], params[j], d, alpha, x, y, eps)
+            _, _, r, _, _, _ = parallelogram_grad(params[i], params[j], d, alpha, x, y, eps)
         diff = alpha * r - d
         total_loss += diff * diff
         total_d2 += d * d
@@ -230,6 +237,7 @@ def _sgd_minibatch_njit_legacy(
     y_init=1.0,
     lr_warmup_init=10.0,
     lr_warmup_decay=25.0,
+    normalize=False,
 ):
     """
     Minibatch SGD for torus MDS on a flat parallelogram torus.
@@ -250,6 +258,12 @@ def _sgd_minibatch_njit_legacy(
     floored at 1e-4. The warmup term vanishes after a few multiples of
     lr_warmup_decay, leaving the plain harmonic decay of the tail. Set
     lr_warmup_init=0 to recover the old pure-harmonic schedule.
+
+    normalize: False optimizes raw stress sum((alpha*r-d)^2); True optimizes
+    normalized stress sum((alpha*r-d)^2 / d^2), i.e. each pair's term is divided
+    by its own d^2 before summing. rect_grad/parallelogram_grad return the
+    per-pair weight (1, or 1/(d^2+eps)) already folded into their gradients; it is
+    reused here to weight the num/den closed-form alpha statistics consistently.
     """
     n = data.shape[0]
     np.random.seed(seed)
@@ -304,14 +318,14 @@ def _sgd_minibatch_njit_legacy(
 
             d = data[i, j]
             if use_rect:
-                g0, g1, dist, gr0_k, gr1_k = rect_grad(
-                    params[i], params[j], d, alpha, r0, r1, eps
+                g0, g1, dist, gr0_k, gr1_k, w = rect_grad(
+                    params[i], params[j], d, alpha, r0, r1, eps, normalize
                 )
                 gr0_sum += gr0_k
                 gr1_sum += gr1_k
             else:
-                g0, g1, dist, ga, gb = parallelogram_grad(
-                    params[i], params[j], d, alpha, x, y, eps
+                g0, g1, dist, ga, gb, w = parallelogram_grad(
+                    params[i], params[j], d, alpha, x, y, eps, normalize
                 )
                 gx_sum += ga
                 gy_sum += gb
@@ -321,8 +335,8 @@ def _sgd_minibatch_njit_legacy(
             params[j, 0] += step_pos * g0
             params[j, 1] += step_pos * g1
 
-            num += d * dist
-            den += dist * dist
+            num += w * d * dist
+            den += w * dist * dist
             used += 1
             drawn += 1
 
@@ -383,6 +397,7 @@ def _run_pair_sequence_online_njit(
     y_init=1.0,
     lr_warmup_init=10.0,
     lr_warmup_decay=25.0,
+    normalize=False,
 ):
     params = init.copy()
     alpha = alpha_init
@@ -434,14 +449,14 @@ def _run_pair_sequence_online_njit(
 
             d = data[i, j]
             if use_rect:
-                g0, g1, dist, gr0_k, gr1_k = rect_grad(
-                    params[i], params[j], d, alpha, r0, r1, eps
+                g0, g1, dist, gr0_k, gr1_k, w = rect_grad(
+                    params[i], params[j], d, alpha, r0, r1, eps, normalize
                 )
                 gr0_sum += gr0_k
                 gr1_sum += gr1_k
             else:
-                g0, g1, dist, ga, gb = parallelogram_grad(
-                    params[i], params[j], d, alpha, x, y, eps
+                g0, g1, dist, ga, gb, w = parallelogram_grad(
+                    params[i], params[j], d, alpha, x, y, eps, normalize
                 )
                 gx_sum += ga
                 gy_sum += gb
@@ -451,8 +466,8 @@ def _run_pair_sequence_online_njit(
             params[j, 0] += step_pos * g0
             params[j, 1] += step_pos * g1
 
-            num += d * dist
-            den += dist * dist
+            num += w * d * dist
+            den += w * dist * dist
 
         params %= 1.0
 
@@ -514,6 +529,7 @@ def sgd_minibatch_njit(
     tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
     patience: int = 5,    # non-improving chunks before stopping
     init=None,
+    normalize=False,       # False: optimize raw stress; True: optimize normalized stress (per-pair /d^2)
 ):
     """
     Minibatch SGD for torus MDS using online updates over unique sampled pairs.
@@ -579,6 +595,7 @@ def sgd_minibatch_njit(
             y_init=y,
             lr_warmup_init=lr_warmup_init,
             lr_warmup_decay=lr_warmup_decay,
+            normalize=normalize,
         )
         start_iter += epochs
 
@@ -685,9 +702,16 @@ class MDSTorusProjector(TorusProjector):
             finalize: Literal[None, "none", "lbfgs"] = None,
             finalize_iters: int = 50,
             finalize_options: Optional[dict] = None,
+            # 'raw': minimize sum((alpha*r-d)^2). 'normalized': minimize
+            # sum((alpha*r-d)^2 / d^2) -- each pair's term is divided by its own
+            # d^2 before summing (not a single division after summing).
+            stress_mode: Literal["raw", "normalized"] = "normalized",
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
+        if stress_mode not in ("raw", "normalized"):
+            raise ValueError(f"stress_mode must be 'raw' or 'normalized', got {stress_mode!r}")
+        normalize = stress_mode == "normalized"
         has_init = init is not None
         mode_int = {
             'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3,
@@ -779,6 +803,7 @@ class MDSTorusProjector(TorusProjector):
             y_init=y0,
             lr_warmup_init=lr_warmup_init,
             lr_warmup_decay=lr_warmup_decay,
+            normalize=normalize,
         )
         if sampled_unique:
             sgd_fn = sgd_minibatch_njit  # sample pairs without replacement; supports early stopping
@@ -798,9 +823,14 @@ class MDSTorusProjector(TorusProjector):
         elif finalize == "lbfgs":
             from .exact_torus_stress import polish_torus_layout
 
+            # Match the SGD objective: normalized stress is equivalent to a
+            # per-pair weight of 1/d^2 in the (already weight-capable) polish
+            # objective, so no separate normalized-stress kernel is needed there.
+            polish_weights = 1.0 / (np.asarray(data, dtype=np.float64) ** 2 + 1e-12) if normalize else None
             result = polish_torus_layout(
                 coords,
                 data,
+                weights=polish_weights,
                 **_polish_shape_kwargs(mode_int, r0, r1, x, y, theta_rad),
                 **_lbfgs_polish_options(finalize_iters, finalize_options),
             )

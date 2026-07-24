@@ -25,6 +25,8 @@ SHARD="${SLURM_ARRAY_TASK_ID}"
 TORUS_MAX_ITERS="${TORUS_MAX_ITERS:-2000}"
 WRAP_PYTHON_MAX_N="${WRAP_PYTHON_MAX_N:-3500}"
 SEED_BASE="${SEED_BASE:-0}"
+STRESS_MODE="${STRESS_MODE:-raw}"
+METHODS="${METHODS:-TorusMDS s_gd2 wrap_python}"
 
 case "$FAMILY" in
   sbm)
@@ -53,12 +55,21 @@ case "$FAMILY" in
     ;;
   suitesparse)
     NUM_SHARDS="${NUM_SHARDS:?Set NUM_SHARDS via --export (must match --array size)}"
+    # Non-'raw' runs land in a separate layouts/ subdir (suitesparse_<mode>) so
+    # they don't collide with -- or get skipped as already-done against --
+    # existing raw-stress layouts/manifests for the same graphs.
+    OUTPUT_SUBDIR="suitesparse"
+    if [ "$STRESS_MODE" != "raw" ]; then
+      OUTPUT_SUBDIR="suitesparse_${STRESS_MODE}"
+    fi
     python verification_experiments/suitesparse_comparison.py \
       --cache-dir "${SUITESPARSE_CACHE_DIR:-data/suitesparse_cache}" \
       --shard-index "$SHARD" --num-shards "$NUM_SHARDS" \
       --torus-max-iters "$TORUS_MAX_ITERS" \
       --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
-      --output-dir "layouts/suitesparse/shard_${SHARD}"
+      --stress-mode "$STRESS_MODE" \
+      --methods $METHODS \
+      --output-dir "layouts/${OUTPUT_SUBDIR}/shard_${SHARD}"
     ;;
   *)
     echo "Unknown FAMILY=$FAMILY (expected sbm|grg|suitesparse)" >&2

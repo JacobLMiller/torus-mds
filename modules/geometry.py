@@ -74,15 +74,23 @@ def _position_grad(du0, du1, g00, g01, g11, scale):
 
 
 @numba.njit(fastmath=True, cache=True)
-def _torus_dist_grad_core(p1, p2, d, alpha, g00, g01, g11, eps):
+def _torus_dist_grad_core(p1, p2, d, alpha, g00, g01, g11, eps, normalize):
     """
     Geometry-agnostic per-pair step shared by the rect and parallelogram kernels:
     wrap the displacement, pick the closest image under Gram (g00, g01, g11), and
     form the (alpha-free) shape length r, the position gradient and the residual
     diff = alpha*r - d.
 
-    Returns (g0, g1, r, du0, du1, diff). The shape-parameter gradient (side lengths
-    or shear/height) is computed separately by the parametrization-specific helper.
+    ``normalize`` selects which per-pair loss term is being differentiated:
+    diff**2 (raw stress) when False, or diff**2 / d**2 (normalized stress, the
+    division living *inside* the sum over pairs) when True. That per-pair weight
+    (1, or 1/(d**2+eps)) is folded into ``wdiff`` (= diff*weight) so every
+    downstream gradient -- position and shape alike, since both are linear in the
+    residual -- is correctly scaled by just substituting wdiff for diff.
+
+    Returns (g0, g1, r, du0, du1, diff, wdiff, weight). The shape-parameter
+    gradient (side lengths or shear/height) is computed separately by the
+    parametrization-specific helper, using wdiff in place of diff.
     """
     du = p2 - p1
     a = _wrap_to_half(du[0])
@@ -93,9 +101,11 @@ def _torus_dist_grad_core(p1, p2, d, alpha, g00, g01, g11, eps):
         r2 = 0.0
     r = np.sqrt(r2) + eps
     diff = alpha * r - d
-    scale = -2.0 * diff * alpha / r
+    weight = 1.0 / (d * d + eps) if normalize else 1.0
+    wdiff = diff * weight
+    scale = -2.0 * wdiff * alpha / r
     g0, g1 = _position_grad(du0, du1, g00, g01, g11, scale)
-    return g0, g1, r, du0, du1, diff
+    return g0, g1, r, du0, du1, diff, wdiff, weight
 
 
 @numba.njit(fastmath=True, cache=True)
@@ -389,13 +399,16 @@ def euclidean_grad(x, y):
 
 
 @numba.njit(fastmath=True, cache=True)
-def rect_stress_and_grad(p1, p2, d, alpha, r0, r1, eps=1e-12):
+def rect_stress_and_grad(p1, p2, d, alpha, r0, r1, eps=1e-12, normalize=False):
     """
     Stress and gradient for a flat *rectangular* (orthogonal) torus with side
     lengths r0, r1. The metric is separable, so the per-coordinate wrap is the exact
     closest image (the core's g01 == 0 closed form -- no candidate search).
 
-    Loss: (alpha * r_rect - d)^2.  Returns: (loss, grad_p1, r_rect, grad_r0, grad_r1).
+    Loss: (alpha * r_rect - d)^2 (raw, normalize=False) or that same residual
+    divided by d^2 (normalized, normalize=True) -- the division lives inside the
+    per-pair term, not around a summed total. Returns: (loss, grad_p1, r_rect,
+    grad_r0, grad_r1).
 
     g00, g01(=0), g11 depend only on (r0, r1) and are constant across an epoch's pair
     loop; rebuilt per call for simplicity but hoistable into the SGD loop (computed
@@ -403,17 +416,24 @@ def rect_stress_and_grad(p1, p2, d, alpha, r0, r1, eps=1e-12):
     """
     g00 = r0 * r0
     g11 = r1 * r1
-    g0, g1, r_rect, du0, du1, diff = _torus_dist_grad_core(p1, p2, d, alpha, g00, 0.0, g11, eps)
-    gr0, gr1 = _shape_grad_rect(du0, du1, diff, r_rect, alpha, r0, r1)
-    return diff * diff, np.array((g0, g1), dtype=p1.dtype), r_rect, gr0, gr1
+    g0, g1, r_rect, du0, du1, diff, wdiff, weight = _torus_dist_grad_core(
+        p1, p2, d, alpha, g00, 0.0, g11, eps, normalize
+    )
+    gr0, gr1 = _shape_grad_rect(du0, du1, wdiff, r_rect, alpha, r0, r1)
+    return diff * wdiff, np.array((g0, g1), dtype=p1.dtype), r_rect, gr0, gr1
 
 
 @numba.njit(fastmath=True, cache=True)
-def rect_grad(p1, p2, d, alpha, r0, r1, eps=1e-12):
+def rect_grad(p1, p2, d, alpha, r0, r1, eps=1e-12, normalize=False):
     """
     Same as rect_stress_and_grad but returns only the gradient (no stress, and g0,g1
     returned directly rather than as an array, to avoid per-pair allocation in the
-    hot SGD loop). Returns: (g0, g1, r_rect, grad_r0, grad_r1).
+    hot SGD loop). Returns: (g0, g1, r_rect, grad_r0, grad_r1, weight).
+
+    ``weight`` is the per-pair loss weight applied (1 for raw stress, 1/(d^2+eps)
+    for normalized stress); callers that accumulate closed-form statistics (e.g.
+    the least-squares alpha update) must weight their sums the same way to stay
+    consistent with the loss actually being minimized.
 
     Orthogonal only (theta = pi/2): for equal-side rhombic or general parallelogram
     geometry use parallelogram_grad. See rect_stress_and_grad re: the per-call Gram
@@ -421,13 +441,15 @@ def rect_grad(p1, p2, d, alpha, r0, r1, eps=1e-12):
     """
     g00 = r0 * r0
     g11 = r1 * r1
-    g0, g1, r_rect, du0, du1, diff = _torus_dist_grad_core(p1, p2, d, alpha, g00, 0.0, g11, eps)
-    gr0, gr1 = _shape_grad_rect(du0, du1, diff, r_rect, alpha, r0, r1)
-    return g0, g1, r_rect, gr0, gr1
+    g0, g1, r_rect, du0, du1, diff, wdiff, weight = _torus_dist_grad_core(
+        p1, p2, d, alpha, g00, 0.0, g11, eps, normalize
+    )
+    gr0, gr1 = _shape_grad_rect(du0, du1, wdiff, r_rect, alpha, r0, r1)
+    return g0, g1, r_rect, gr0, gr1, weight
 
 
 @numba.njit(fastmath=True, cache=True)
-def parallelogram_grad(p1, p2, d, alpha, x, y, eps=1e-12):
+def parallelogram_grad(p1, p2, d, alpha, x, y, eps=1e-12, normalize=False):
     """
     Stress gradient for a flat parallelogram torus in the (alpha, x, y)
     parametrization. Shape metric (alpha factored out as overall scale):
@@ -441,14 +463,22 @@ def parallelogram_grad(p1, p2, d, alpha, x, y, eps=1e-12):
     is the equal-sides combination of (gx, gy), applied to the aggregated sums in the
     projector's geometry update.
 
+    ``normalize`` selects raw ((alpha*r-d)^2) vs normalized ((alpha*r-d)^2/d^2,
+    division inside the per-pair term) loss -- see _torus_dist_grad_core. The
+    returned ``weight`` (1, or 1/(d^2+eps)) must be used to weight any closed-form
+    statistics accumulated by the caller (e.g. the least-squares alpha update), to
+    stay consistent with the loss actually being minimized.
+
     The Gram (1, x, x^2+y^2) depends only on the geometry and is constant across an
     epoch's pair loop; rebuilt per call for simplicity but hoistable into the SGD loop
-    if needed. Returns: (g0, g1, r_shape, grad_x, grad_y).
+    if needed. Returns: (g0, g1, r_shape, grad_x, grad_y, weight).
     """
     g11 = x * x + y * y
-    g0, g1, r_shape, du0, du1, diff = _torus_dist_grad_core(p1, p2, d, alpha, 1.0, x, g11, eps)
-    gx, gy = _shape_grad_parallelogram(du0, du1, diff, r_shape, alpha, x, y)
-    return g0, g1, r_shape, gx, gy
+    g0, g1, r_shape, du0, du1, diff, wdiff, weight = _torus_dist_grad_core(
+        p1, p2, d, alpha, 1.0, x, g11, eps, normalize
+    )
+    gx, gy = _shape_grad_parallelogram(du0, du1, wdiff, r_shape, alpha, x, y)
+    return g0, g1, r_shape, gx, gy, weight
 
 
 def torus_delta(p, q):

@@ -56,9 +56,10 @@ def embed_torus_mds(
     D: np.ndarray,
     max_iters: int = 2000,
     seed: int = 42,
+    stress_mode: str = "raw",
 ) -> tuple[np.ndarray, float]:
     proj = MDSTorusProjector(projection="wrap")
-    X = proj.fit_transform(D, max_iters=max_iters, seed=seed)
+    X = proj.fit_transform(D, max_iters=max_iters, seed=seed, stress_mode=stress_mode)
     return X, float(proj.alpha_)
 
 
@@ -122,6 +123,8 @@ def run_embeddings(
     method_max_n: dict[str, int | None] | None = None,
     checkpoint_every: int = 20,
     seed: int = 0,
+    methods: tuple[str, ...] = METHODS,
+    torus_stress_mode: str = "raw",
 ) -> pd.DataFrame:
     method_max_n = {**DEFAULT_METHOD_MAX_N, **(method_max_n or {})}
 
@@ -150,7 +153,7 @@ def run_embeddings(
         exp_idx, meta, G = rec.exp_idx, rec.meta, rec.graph
         n = G.number_of_nodes()
 
-        methods_needed = [m for m in METHODS if (exp_idx, m) not in done]
+        methods_needed = [m for m in methods if (exp_idx, m) not in done]
         if not methods_needed:
             continue
 
@@ -173,7 +176,9 @@ def run_embeddings(
                     alpha_fit = float("nan")
                 elif method == "TorusMDS":
                     D, _ = apsp_distance_matrix(G)
-                    X, alpha_fit = embed_torus_mds(D, max_iters=torus_max_iters, seed=seed)
+                    X, alpha_fit = embed_torus_mds(
+                        D, max_iters=torus_max_iters, seed=seed, stress_mode=torus_stress_mode
+                    )
                 elif method == "wrap_python":
                     X = embed_wrap_python(G, max_iters=wrap_python_max_iters, seed=seed)
                     alpha_fit = float("nan")
