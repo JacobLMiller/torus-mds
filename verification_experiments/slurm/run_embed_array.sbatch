@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=torus-embed
 #SBATCH --partition=compute
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=2
 #SBATCH --time=00:30:00
 #SBATCH --mem=4G
 #SBATCH --array=0-9

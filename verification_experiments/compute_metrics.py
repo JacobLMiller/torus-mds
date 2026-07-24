@@ -32,7 +32,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules.experiment_runner import coords_path, graph_path, load_graph
 from modules.geometry import euc_distance, torus_distance
 from modules.graphio import apsp_distance_matrix
-from modules.metrics import SGS, estimate_alpha, geodesic_distortion, geodesic_NP, geodesic_stress
+from modules.metrics import (
+    SGS,
+    estimate_alpha,
+    geodesic_distortion,
+    geodesic_NP,
+    geodesic_stress,
+    pointwise_geodesic_stress,
+)
 
 # Manifest columns that are embedding-phase bookkeeping, not result metadata.
 _MANIFEST_ONLY_COLUMNS = {"status", "alpha_fit", "seed"}
@@ -56,6 +63,7 @@ def compute_metrics(X: np.ndarray, D: np.ndarray, geod, rg: float = 2.0) -> dict
     """Compute all four metrics from metrics.py on the given (already max_n-sized) layout/distances."""
     return dict(
         stress=geodesic_stress(X, D, geod),
+        pointwise_stress=pointwise_geodesic_stress(X, D, geod),
         distortion=geodesic_distortion(X, D, geod),
         sgs=SGS(X, D, geod),
         np_score=geodesic_NP(X, D, geod, rg=rg),
@@ -63,13 +71,17 @@ def compute_metrics(X: np.ndarray, D: np.ndarray, geod, rg: float = 2.0) -> dict
 
 
 def _geod_for(method: str, X: np.ndarray, D: np.ndarray):
+    # Re-estimate scale on the same (already subsampled) points used for the
+    # metrics below, not the full graph -- estimate_alpha is an unvectorized
+    # O(k^2) Python loop (like every other metric here), and at n=10,000
+    # that's ~50M Python-level calls if run on the full graph instead of the
+    # subsample. Fitting alpha for s_gd2/Euclidean too (not just the torus
+    # methods) keeps stress comparable across methods -- an unscaled
+    # Euclidean embedding's raw distances are an arbitrary size, so without
+    # this the stress numbers aren't on the same footing.
     if method == "s_gd2":
-        return euc_distance, float("nan")
-    # TorusMDS / wrap_python: re-estimate scale on the same (already
-    # subsampled) points used for the metrics below, not the full graph --
-    # estimate_alpha is an unvectorized O(k^2) Python loop (like every other
-    # metric here), and at n=10,000 that's ~50M Python-level calls if run on
-    # the full graph instead of the subsample.
+        alpha = estimate_alpha(X, D, geod=euc_distance)
+        return (lambda p, q, a=alpha: a * euc_distance(p, q)), alpha
     alpha = estimate_alpha(X, D)
     return (lambda p, q, a=alpha: a * torus_distance(p, q)), alpha
 
