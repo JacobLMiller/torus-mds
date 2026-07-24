@@ -47,6 +47,90 @@ def geodesic_stress(X: np.ndarray, D: np.ndarray, geod) -> float:
     return float(np.sqrt(num / denom))
 
 
+def scaled_geodesic_stress(
+    X: np.ndarray, D: np.ndarray, geod, alpha: float | None = None
+) -> tuple[float, float]:
+    """
+    Scale-invariant counterpart to ``geodesic_stress``: fits a uniform scale
+    alpha for the embedding distances r_ij = geod(x_i, x_j) before computing
+    stress, so the result is unchanged if X is globally rescaled (e.g. an
+    unconstrained Euclidean embedding, where ``geodesic_stress`` would
+    otherwise change with the embedding's size). Same objective as
+    ``rect_torus_stress``, but for an arbitrary geod:
+
+        alpha = sum_{i<j}[D_ij * r_ij] / sum_{i<j}[r_ij^2]
+        stress = sqrt( sum_{i<j}(alpha*r_ij - D_ij)^2 / sum_{i<j} D_ij^2 )
+
+    alpha=None -> closed-form best-fit alpha; pass a fixed value to evaluate
+    stress at that scale instead. Returns (stress, alpha).
+    """
+    n = X.shape[0]
+    sdr, sr2, sd2 = 0.0, 0.0, 0.0
+    for i in range(n):
+        for j in range(i):
+            r = geod(X[i], X[j])
+            d = D[i, j]
+            sdr += d * r
+            sr2 += r * r
+            sd2 += d * d
+    if alpha is None:
+        alpha = sdr / sr2
+    num = alpha * alpha * sr2 - 2.0 * alpha * sdr + sd2   # = sum (alpha*r - D)^2
+    return float(np.sqrt(num / sd2)), float(alpha)
+
+
+def pointwise_geodesic_stress(X: np.ndarray, D: np.ndarray, geod) -> float:
+    """
+    Per-pair-normalised counterpart to ``geodesic_stress``: each pair's squared
+    residual is divided by its own D_ij^2 before summing (rather than once, by
+    the total sum(D^2), at the end), then averaged over all pairs -- an RMS
+    relative-distance error. Matches the per-pair weighting used for
+    ``stress_mode='normalized'`` training in ``TorusProjector.fit``.
+
+        stress = sqrt( mean_{i<j}[ (geod(x_i,x_j) - D_ij)^2 / D_ij^2 ] )
+    """
+    n = X.shape[0]
+    nchoose2 = (n * (n-1) // 2)
+    total = 0.0
+    for i in range(n):
+        for j in range(i):
+            d = D[i, j]
+            total += ((geod(X[i], X[j]) - d) / d) ** 2
+
+    return float(np.sqrt(total / nchoose2))
+
+
+def scaled_pointwise_geodesic_stress(
+    X: np.ndarray, D: np.ndarray, geod, alpha: float | None = None
+) -> tuple[float, float]:
+    """
+    Scale-invariant counterpart to ``pointwise_geodesic_stress``: fits a
+    uniform scale alpha for the embedding distances r_ij = geod(x_i, x_j)
+    before computing stress, so the result is unchanged if X is globally
+    rescaled. This minimises a differently-weighted objective than
+    ``scaled_geodesic_stress``, so the closed-form alpha differs:
+
+        alpha = sum_{i<j}[r_ij / D_ij] / sum_{i<j}[(r_ij / D_ij)^2]
+        stress = sqrt( mean_{i<j}[ (alpha*r_ij - D_ij)^2 / D_ij^2 ] )
+
+    alpha=None -> closed-form best-fit alpha; pass a fixed value to evaluate
+    stress at that scale instead. Returns (stress, alpha).
+    """
+    n = X.shape[0]
+    sum_s, sum_s2 = 0.0, 0.0
+    count = 0
+    for i in range(n):
+        for j in range(i):
+            s = geod(X[i], X[j]) / D[i, j]
+            sum_s += s
+            sum_s2 += s * s
+            count += 1
+    if alpha is None:
+        alpha = sum_s / sum_s2
+    loss = alpha * alpha * sum_s2 - 2.0 * alpha * sum_s + count   # = sum (alpha*s - 1)^2
+    return float(np.sqrt(loss / count)), float(alpha)
+
+
 @numba.njit(parallel=True, fastmath=True, cache=True)
 def _rect_torus_stress_accum(X, D, r0, r1):
     """Accumulate sum_{i<j} of d*r, r*r, d*d for a rectangular (theta=90) torus,
