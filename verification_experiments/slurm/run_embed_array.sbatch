@@ -55,12 +55,16 @@ case "$FAMILY" in
     ;;
   suitesparse)
     NUM_SHARDS="${NUM_SHARDS:?Set NUM_SHARDS via --export (must match --array size)}"
-    # Non-'raw' runs land in a separate layouts/ subdir (suitesparse_<mode>) so
-    # they don't collide with -- or get skipped as already-done against --
-    # existing raw-stress layouts/manifests for the same graphs.
+    # Runs that deviate from the (raw, 2000-iter) default land in a
+    # distinctly-named layouts/ subdir so they don't collide with -- or get
+    # skipped as already-done against -- manifests from a different
+    # configuration on the same graphs (e.g. an iteration-count ablation).
     OUTPUT_SUBDIR="suitesparse"
     if [ "$STRESS_MODE" != "raw" ]; then
-      OUTPUT_SUBDIR="suitesparse_${STRESS_MODE}"
+      OUTPUT_SUBDIR="${OUTPUT_SUBDIR}_${STRESS_MODE}"
+    fi
+    if [ "$TORUS_MAX_ITERS" != "2000" ]; then
+      OUTPUT_SUBDIR="${OUTPUT_SUBDIR}_iters${TORUS_MAX_ITERS}"
     fi
     python verification_experiments/suitesparse_comparison.py \
       --cache-dir "${SUITESPARSE_CACHE_DIR:-data/suitesparse_cache}" \
