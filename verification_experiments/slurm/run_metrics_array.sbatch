@@ -14,7 +14,7 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
 cd "$REPO_ROOT"
 
 
-source "${MINIFORGE_ROOT:-$HOME/miniforge3}/etc/profile.d/conda.sh"
+source "${MINIFORGE_ROOT:-$HOME/nobackup/miniforge3}/etc/profile.d/conda.sh"
 conda activate torus-mds
 
 FAMILY="${FAMILY:?Set FAMILY=sbm|grg|suitesparse via --export}"
