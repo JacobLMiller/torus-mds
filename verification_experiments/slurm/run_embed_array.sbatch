@@ -38,6 +38,7 @@ case "$FAMILY" in
       --n-min "$N_MIN" --n-max "$N_MAX" \
       --torus-max-iters "$TORUS_MAX_ITERS" \
       --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
+      --methods $METHODS \
       --output-dir "layouts/sbm/${N_MIN}_${N_MAX}/shard_${SHARD}" \
       --seed "$((SEED_BASE + SHARD))"
     ;;
@@ -45,11 +46,14 @@ case "$FAMILY" in
     N_MIN="${N_MIN:?Set N_MIN via --export}"
     N_MAX="${N_MAX:?Set N_MAX via --export}"
     GRAPHS_PER_SHARD="${GRAPHS_PER_SHARD:?Set GRAPHS_PER_SHARD via --export}"
+    GRAPH_TYPE_WEIGHTS="${GRAPH_TYPE_WEIGHTS:-1,1,1}"
     python verification_experiments/grg_comparison.py \
       --n-graphs "$GRAPHS_PER_SHARD" \
       --n-min "$N_MIN" --n-max "$N_MAX" \
+      --graph-type-weights "$GRAPH_TYPE_WEIGHTS" \
       --torus-max-iters "$TORUS_MAX_ITERS" \
       --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
+      --methods $METHODS \
       --output-dir "layouts/grg/${N_MIN}_${N_MAX}/shard_${SHARD}" \
       --seed "$((SEED_BASE + SHARD))"
     ;;

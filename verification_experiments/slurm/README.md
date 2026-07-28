@@ -116,7 +116,25 @@ sbatch --array=0-2 --time=03:00:00 --mem=8G \
     verification_experiments/slurm/run_embed_array.sbatch
 ```
 
-Repeat with `FAMILY=grg`. For SuiteSparse (a fixed pre-staged pool, sharded
+Repeat with `FAMILY=grg`.
+
+By default each family runs all three methods (`TorusMDS s_gd2 wrap_python`).
+Restrict via `--export=ALL,...,METHODS="TorusMDS s_gd2"` (space-separated,
+matches `run_embeddings`'s `methods=` choices) to skip `wrap_python` --
+useful since it's the slowest method by far and the one most often excluded
+from a quick comparison. For `FAMILY=grg`, `GRAPH_TYPE_WEIGHTS` (default
+`1,1,1`, i.e. euclidean/toroidal/spherical in equal thirds) selects the mix
+of GRG variants generated; `GRAPH_TYPE_WEIGHTS="0,1,0"` generates toroidal
+GRGs only. Example -- TorusMDS vs. s_gd2 only, pure toroidal GRG, n in
+[100, 5000]:
+
+```bash
+sbatch --array=0-9 --time=02:00:00 --mem=4G \
+    --export=ALL,FAMILY=grg,N_MIN=100,N_MAX=5000,GRAPHS_PER_SHARD=250,GRAPH_TYPE_WEIGHTS="0,1,0",METHODS="TorusMDS s_gd2" \
+    verification_experiments/slurm/run_embed_array.sbatch
+```
+
+For SuiteSparse (a fixed pre-staged pool, sharded
 by interleaving rather than by size tier since it spans the whole range at
 once):
 
