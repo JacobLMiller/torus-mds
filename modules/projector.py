@@ -101,6 +101,50 @@ def _build_sampled_unique_pair_sequence_from_pairs(
     return result
 
 
+def _build_weighted_pair_alias(probabilities: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Walker alias table for O(1) draws from a fixed pair distribution."""
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    n = len(probabilities)
+    scaled = probabilities * n
+    accept = np.empty(n, dtype=np.float64)
+    alias = np.empty(n, dtype=np.int32)
+    small = [int(i) for i in np.flatnonzero(scaled < 1.0)]
+    large = [int(i) for i in np.flatnonzero(scaled >= 1.0)]
+    while small and large:
+        lo = small.pop()
+        hi = large.pop()
+        accept[lo] = scaled[lo]
+        alias[lo] = hi
+        scaled[hi] -= 1.0 - scaled[lo]
+        if scaled[hi] < 1.0:
+            small.append(hi)
+        else:
+            large.append(hi)
+    for i in small + large:
+        accept[i] = 1.0
+        alias[i] = i
+    return accept, alias
+
+
+def _build_weighted_pair_sequence_from_pairs(
+    pairs: np.ndarray,
+    rng: np.random.Generator,
+    epochs: int,
+    batch_pairs: int,
+    accept: np.ndarray,
+    alias: np.ndarray,
+) -> NumbaList:
+    """Sample pair batches with replacement using a precomputed alias table."""
+    total_pairs = len(pairs)
+    result = NumbaList()
+    for _ in range(epochs):
+        column = rng.integers(total_pairs, size=batch_pairs)
+        choose_alias = rng.random(batch_pairs) >= accept[column]
+        column[choose_alias] = alias[column[choose_alias]]
+        result.append(np.asarray(pairs[column], dtype=np.int32))
+    return result
+
+
 @numba.njit(cache=True, fastmath=True)
 def _batch_stress_njit(data, params, pairs, alpha, r0, r1, x, y, use_rect, eps=1e-12, normalize=False):
     """
@@ -161,7 +205,10 @@ def _profile_alpha_njit(data, params, r0, r1, x, y, use_rect, eps=1e-12, normali
 
 
 @numba.njit(cache=True, fastmath=True)
-def _profile_alpha_pairs_njit(data, params, pairs, r0, r1, x, y, use_rect, eps=1e-12, normalize=False):
+def _profile_alpha_pairs_njit(
+    data, params, pairs, r0, r1, x, y, use_rect, eps=1e-12, normalize=False,
+    sampling_gamma=0.0, sampling_correction=1.0,
+):
     """Exact least-squares scale on one sampled pair batch."""
     num = 0.0
     den = 0.0
@@ -176,6 +223,8 @@ def _profile_alpha_pairs_njit(data, params, pairs, r0, r1, x, y, use_rect, eps=1
             r = np.sqrt(max(0.0, g00 * du0 * du0 + g11 * du1 * du1)) + eps
             d = data[i, j]
             w = 1.0 / (d * d + eps) if normalize else 1.0
+            if sampling_gamma > 0.0:
+                w *= sampling_correction * d ** (2.0 * sampling_gamma)
             num += w * d * r
             den += w * r * r
     else:
@@ -189,6 +238,8 @@ def _profile_alpha_pairs_njit(data, params, pairs, r0, r1, x, y, use_rect, eps=1
             r = np.sqrt(max(0.0, _gram_quad(du0, du1, 1.0, x, g11))) + eps
             d = data[i, j]
             w = 1.0 / (d * d + eps) if normalize else 1.0
+            if sampling_gamma > 0.0:
+                w *= sampling_correction * d ** (2.0 * sampling_gamma)
             num += w * d * r
             den += w * r * r
     return num / (den + eps)
@@ -453,6 +504,8 @@ def _run_pair_sequence_online_njit(
     bounded=True,
     pair_step_cap=0.10,       # Max fractional-coordinate displacement of either endpoint per pair.
     batch_profile_alpha=False,
+    sampling_gamma=0.0,
+    sampling_correction=1.0,
 ):
     params = init.copy()
     alpha = alpha_init
@@ -508,6 +561,9 @@ def _run_pair_sequence_online_njit(
             j = seq[k, 1]
 
             d = data[i, j]
+            importance = 1.0
+            if sampling_gamma > 0.0:
+                importance = sampling_correction * d ** (2.0 * sampling_gamma)
             if use_rect:
                 g0, g1, dist, gr0_k, gr1_k, w = rect_grad(
                     params[i], params[j], d, alpha, r0, r1, eps, normalize
@@ -520,6 +576,16 @@ def _run_pair_sequence_online_njit(
                 )
                 gx_sum += ga
                 gy_sum += gb
+
+            if importance != 1.0:
+                g0 *= importance
+                g1 *= importance
+                if use_rect:
+                    gr0_sum += (importance - 1.0) * gr0_k
+                    gr1_sum += (importance - 1.0) * gr1_k
+                else:
+                    gx_sum += (importance - 1.0) * ga
+                    gy_sum += (importance - 1.0) * gb
 
             if bounded:
                 if normalize:
@@ -593,7 +659,8 @@ def _run_pair_sequence_online_njit(
             if batch_profile_alpha and learn_mode in (1, 4, 5, 6):
                 # Profile on the completed, wrapped batch layout.
                 alpha = _profile_alpha_pairs_njit(
-                    data, params, seq, r0, r1, x, y, use_rect, eps, normalize
+                    data, params, seq, r0, r1, x, y, use_rect, eps, normalize,
+                    sampling_gamma, sampling_correction,
                 )
                 alpha = max(alpha_min, min(alpha_max, alpha))
 
@@ -627,11 +694,14 @@ def sgd_minibatch_njit(
     normalize=False,       # False: optimize raw stress; True: optimize normalized stress (per-pair /d^2)
     bounded=True,
     pair_step_cap=0.10,
+    normalized_pair_sampling="auto",
 ):
     """
-    Minibatch SGD for torus MDS using online updates over unique sampled pairs.
+    Minibatch SGD for torus MDS using online pair updates.
 
-    This replaces the older with-replacement pair sampling
+    Raw and uniform-normalized batches sample pairs without replacement. Direct
+    normalized importance batches sample with replacement from their fixed
+    target-distance distribution, with an unbiased correction.
 
     init: optional (N, 2) initial positions; wrapped to [0,1). Random if None.
 
@@ -659,6 +729,29 @@ def sgd_minibatch_njit(
     rng = np.random.default_rng(seed)
     pairs = _all_unique_pairs(n)
     use_rect = learn_mode <= 4 and abs(np.cos(theta)) < 1e-12
+    # Importance sampling is calibrated for the direct metric-gradient path
+    weighted_sampling = normalize and not bounded and normalized_pair_sampling == "importance"
+    sampling_gamma = 0.0
+    sampling_correction = 1.0
+    alias_accept = None
+    alias_index = None
+    if weighted_sampling:
+        pair_distances = data[pairs[:, 0], pairs[:, 1]]
+        sampling_gamma = 1.0
+        sampling_weights = pair_distances ** (-2.0 * sampling_gamma)
+        sampling_correction = float(sampling_weights.mean())
+        alias_accept, alias_index = _build_weighted_pair_alias(sampling_weights / sampling_weights.sum())
+    elif normalize and not bounded and normalized_pair_sampling == "auto":
+        pair_weights = 1.0 / (data[pairs[:, 0], pairs[:, 1]] ** 2 + eps)
+        effective_pair_fraction = (pair_weights.sum() ** 2 / np.sum(pair_weights * pair_weights)) / len(pair_weights)
+        # Empirical separation: the SuiteSparse cases are below 2.5%, whereas
+        # the current synthetic suites are above 25%; 10% selects only the
+        # strongly concentrated normalized objectives.
+        if effective_pair_fraction < 0.10:
+            weighted_sampling = True
+            sampling_gamma = 1.0
+            sampling_correction = float(pair_weights.mean())
+            alias_accept, alias_index = _build_weighted_pair_alias(pair_weights / pair_weights.sum())
 
     stress_sample = None
     bad_chunks = 0
@@ -675,7 +768,12 @@ def sgd_minibatch_njit(
     while start_iter < max_iters:
         until_check = next_check - start_iter if tol > 0.0 else max_iters - start_iter
         epochs = min(chunk_epochs, until_check, max_iters - start_iter)
-        sequence = _build_sampled_unique_pair_sequence_from_pairs(pairs, rng, epochs, batch_pairs)
+        if weighted_sampling:
+            sequence = _build_weighted_pair_sequence_from_pairs(
+                pairs, rng, epochs, batch_pairs, alias_accept, alias_index
+            )
+        else:
+            sequence = _build_sampled_unique_pair_sequence_from_pairs(pairs, rng, epochs, batch_pairs)
         # The first bounded update uses a scale-consistent profile of its
         # sampled pair batch; every later batch is profiled after its update.
         if start_iter == 0 and bounded and learn_mode in (1, 4, 5, 6):
@@ -707,6 +805,8 @@ def sgd_minibatch_njit(
             bounded=bounded,
             pair_step_cap=pair_step_cap,
             batch_profile_alpha=True,
+            sampling_gamma=sampling_gamma,
+            sampling_correction=sampling_correction,
         )
         start_iter += epochs
 
@@ -822,17 +922,30 @@ class MDSTorusProjector(TorusProjector):
             stress_mode: Literal["raw", "normalized"] = "raw",
             coordinate_update: Literal["bounded", "gradient"] | None = None,
             pair_step_cap: float = 0.10,
+            normalized_pair_sampling: Literal["auto", "importance", "uniform"] = "auto",
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
         if stress_mode not in ("raw", "normalized"):
             raise ValueError(f"stress_mode must be 'raw' or 'normalized', got {stress_mode!r}")
+        if normalized_pair_sampling not in ("auto", "importance", "uniform"):
+            raise ValueError(
+                "normalized_pair_sampling must be 'auto', 'importance', or 'uniform', "
+                f"got {normalized_pair_sampling!r}"
+            )
         if coordinate_update is None:
             coordinate_update = "gradient" if stress_mode == "normalized" else "bounded"
         if coordinate_update not in ("bounded", "gradient"):
             raise ValueError(
                 "coordinate_update must be 'bounded' or 'gradient', "
                 f"got {coordinate_update!r}"
+            )
+        if normalized_pair_sampling == "importance" and (
+            stress_mode != "normalized" or coordinate_update != "gradient" or not sampled_unique
+        ):
+            raise ValueError(
+                "normalized_pair_sampling='importance' requires sampled_unique direct "
+                "normalized-gradient optimization"
             )
         if pair_step_cap <= 0.0:
             raise ValueError(f"pair_step_cap must be positive, got {pair_step_cap}")
@@ -931,12 +1044,13 @@ class MDSTorusProjector(TorusProjector):
             normalize=normalize,
         )
         if sampled_unique:
-            sgd_fn = sgd_minibatch_njit  # sample pairs without replacement; supports early stopping
+            sgd_fn = sgd_minibatch_njit  # uniform raw / importance-sampled normalized pairs
             kwargs["tol"] = tol
             kwargs["patience"] = patience
             kwargs["init"] = init
             kwargs["bounded"] = coordinate_update == "bounded"
             kwargs["pair_step_cap"] = pair_step_cap
+            kwargs["normalized_pair_sampling"] = normalized_pair_sampling
         else:
             if init is not None:
                 raise ValueError("init is only supported with sampled_unique=True")
