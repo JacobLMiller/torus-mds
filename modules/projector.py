@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional, Literal, Tuple
+import time
+import warnings
 
 import numpy as np
 import numba
@@ -690,6 +692,8 @@ def sgd_minibatch_njit(
     lr_warmup_decay=25.0,
     tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
     patience: int = 5,    # non-improving chunks before stopping
+    time_limit_seconds: Optional[float] = None,
+    run_info: Optional[dict] = None,
     init=None,
     normalize=False,       # False: optimize raw stress; True: optimize normalized stress (per-pair /d^2)
     bounded=True,
@@ -705,8 +709,19 @@ def sgd_minibatch_njit(
 
     init: optional (N, 2) initial positions; wrapped to [0,1). Random if None.
 
+    The optional wall-time limit is cooperative: it is checked between sequence
+    chunks, so a running compiled chunk is allowed to finish before returning
+    the current layout. ``run_info`` is populated with the completed iteration
+    count, elapsed SGD time, time-limit status, and termination reason when
+    supplied.
+
     Returns: (params, alpha, r0, r1, x, y)
     """
+    started_at = time.perf_counter()
+    if time_limit_seconds is not None and (
+        not np.isfinite(time_limit_seconds) or time_limit_seconds <= 0.0
+    ):
+        raise ValueError("time_limit_seconds must be a finite positive number or None")
     data = np.asarray(data, dtype=np.float64)
     if pair_step_cap <= 0.0:
         raise ValueError("pair_step_cap must be positive")
@@ -724,6 +739,14 @@ def sgd_minibatch_njit(
     x = float(x_init)
     y = float(y_init)
     if max_iters <= 0 or n < 2:
+        if run_info is not None:
+            run_info.update(
+                iterations=0,
+                time_limit_reached=False,
+                time_limit_seconds=time_limit_seconds,
+                elapsed_seconds=time.perf_counter() - started_at,
+                termination_reason="max_iters" if max_iters <= 0 else "insufficient_points",
+            )
         return params, alpha, r0, r1, x, y
 
     rng = np.random.default_rng(seed)
@@ -765,7 +788,13 @@ def sgd_minibatch_njit(
 
     next_check = chunk_epochs
     start_iter = 0
+    time_limit_reached = False
+    termination_reason = None
     while start_iter < max_iters:
+        if time_limit_seconds is not None and time.perf_counter() - started_at >= time_limit_seconds:
+            time_limit_reached = True
+            termination_reason = "time_limit"
+            break
         until_check = next_check - start_iter if tol > 0.0 else max_iters - start_iter
         epochs = min(chunk_epochs, until_check, max_iters - start_iter)
         if weighted_sampling:
@@ -774,6 +803,10 @@ def sgd_minibatch_njit(
             )
         else:
             sequence = _build_sampled_unique_pair_sequence_from_pairs(pairs, rng, epochs, batch_pairs)
+        if time_limit_seconds is not None and time.perf_counter() - started_at >= time_limit_seconds:
+            time_limit_reached = True
+            termination_reason = "time_limit"
+            break
         # The first bounded update uses a scale-consistent profile of its
         # sampled pair batch; every later batch is profiled after its update.
         if start_iter == 0 and bounded and learn_mode in (1, 4, 5, 6):
@@ -781,6 +814,10 @@ def sgd_minibatch_njit(
                 data, params, sequence[0], r0, r1, x, y, use_rect, eps, normalize
             )
             alpha = max(alpha_min, min(alpha_max, alpha))
+        if time_limit_seconds is not None and time.perf_counter() - started_at >= time_limit_seconds:
+            time_limit_reached = True
+            termination_reason = "time_limit"
+            break
         params, alpha, r0, r1, x, y = _run_pair_sequence_online_njit(
             data=data,
             pair_sequence=sequence,
@@ -809,6 +846,14 @@ def sgd_minibatch_njit(
             sampling_correction=sampling_correction,
         )
         start_iter += epochs
+        if (
+            start_iter < max_iters
+            and time_limit_seconds is not None
+            and time.perf_counter() - started_at >= time_limit_seconds
+        ):
+            time_limit_reached = True
+            termination_reason = "time_limit"
+            break
 
         if tol > 0.0 and start_iter == next_check:
             curr_stress = _batch_stress_njit(
@@ -818,12 +863,23 @@ def sgd_minibatch_njit(
             if rel_change < tol:
                 bad_chunks += 1
                 if bad_chunks >= patience:
+                    termination_reason = "tolerance"
                     break
             else:
                 bad_chunks = 0
             prev_stress = curr_stress
             next_check += chunk_epochs
 
+    if termination_reason is None:
+        termination_reason = "max_iters"
+    if run_info is not None:
+        run_info.update(
+            iterations=start_iter,
+            time_limit_reached=time_limit_reached,
+            time_limit_seconds=time_limit_seconds,
+            elapsed_seconds=time.perf_counter() - started_at,
+            termination_reason=termination_reason,
+        )
     return params, alpha, r0, r1, x, y
 
 
@@ -852,6 +908,11 @@ class TorusProjector:
     x_: Optional[float] = field(default=None, init=False)
     y_: Optional[float] = field(default=None, init=False)
     finalization_info_: dict = field(default_factory=lambda: {"mode": None}, init=False)
+    time_limit_reached_: bool = field(default=False, init=False)
+    time_limit_seconds_: Optional[float] = field(default=None, init=False)
+    sgd_elapsed_seconds_: Optional[float] = field(default=None, init=False)
+    n_iter_: Optional[int] = field(default=None, init=False)
+    termination_reason_: Optional[str] = field(default=None, init=False)
 
     def fit_transform(self, D: np.ndarray, **kwargs) -> np.ndarray:
         D = _check_distance_matrix(D)
@@ -913,6 +974,9 @@ class MDSTorusProjector(TorusProjector):
             # --- convergence criteria (sampled_unique path only) ---
             tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
             patience: int = 5,    # non-improving chunks before stopping
+            # Cooperative sampled-unique SGD wall-time budget; L-BFGS polishing
+            # is skipped when set because SciPy cannot be stopped safely mid-run.
+            time_limit_seconds: Optional[float] = None,
             finalize: Literal[None, "none", "lbfgs"] = None,
             finalize_iters: int = 50,
             finalize_options: Optional[dict] = None,
@@ -949,6 +1013,19 @@ class MDSTorusProjector(TorusProjector):
             )
         if pair_step_cap <= 0.0:
             raise ValueError(f"pair_step_cap must be positive, got {pair_step_cap}")
+        if time_limit_seconds is not None and (
+            not np.isfinite(time_limit_seconds) or time_limit_seconds <= 0.0
+        ):
+            raise ValueError("time_limit_seconds must be a finite positive number or None")
+        if time_limit_seconds is not None and not sampled_unique:
+            raise ValueError("time_limit_seconds requires sampled_unique=True")
+        if time_limit_seconds is not None and finalize == "lbfgs":
+            warnings.warn(
+                "time_limit_seconds skips L-BFGS polishing because it cannot be "
+                "safely interrupted; the returned layout is the current SGD result.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         normalize = stress_mode == "normalized"
         has_init = init is not None
         mode_int = {
@@ -1025,6 +1102,7 @@ class MDSTorusProjector(TorusProjector):
 
         alpha_kernel = alpha_init * r0_init if non_orth_rect else alpha_init
 
+        run_info = {}
         kwargs = dict(
             data=data,
             learning_rate=learning_rate,
@@ -1047,6 +1125,8 @@ class MDSTorusProjector(TorusProjector):
             sgd_fn = sgd_minibatch_njit  # uniform raw / importance-sampled normalized pairs
             kwargs["tol"] = tol
             kwargs["patience"] = patience
+            kwargs["time_limit_seconds"] = time_limit_seconds
+            kwargs["run_info"] = run_info
             kwargs["init"] = init
             kwargs["bounded"] = coordinate_update == "bounded"
             kwargs["pair_step_cap"] = pair_step_cap
@@ -1061,9 +1141,23 @@ class MDSTorusProjector(TorusProjector):
             use_rect = mode_int <= 4 and abs(np.cos(theta_rad)) < 1e-12
             alpha = _profile_alpha_njit(data, coords, r0, r1, x, y, use_rect, normalize=normalize)
 
-        final_info = {"mode": None}
+        self.time_limit_reached_ = bool(run_info.get("time_limit_reached", False))
+        self.time_limit_seconds_ = time_limit_seconds
+        self.sgd_elapsed_seconds_ = run_info.get("elapsed_seconds")
+        self.n_iter_ = run_info.get("iterations")
+        self.termination_reason_ = run_info.get("termination_reason")
+        final_info = {
+            "mode": None,
+            "time_limit_reached": self.time_limit_reached_,
+            "time_limit_seconds": time_limit_seconds,
+            "sgd_elapsed_seconds": self.sgd_elapsed_seconds_,
+            "sgd_n_iter": self.n_iter_,
+            "termination_reason": self.termination_reason_,
+        }
         if finalize in (None, "none"):
             pass
+        elif finalize == "lbfgs" and time_limit_seconds is not None:
+            final_info["finalization_skipped"] = "time_limit"
         elif finalize == "lbfgs":
             from .exact_torus_stress import polish_torus_layout
 
@@ -1085,7 +1179,12 @@ class MDSTorusProjector(TorusProjector):
             x = result.x
             y = result.y_shape
             theta_rad = result.theta
-            final_info = {"mode": "lbfgs", **result.convergence_info, "n_iter": result.n_iter}
+            final_info = {
+                **final_info,
+                "mode": "lbfgs",
+                **result.convergence_info,
+                "n_iter": result.n_iter,
+            }
         else:
             raise ValueError("finalize must be None, 'none', or 'lbfgs'")
 
