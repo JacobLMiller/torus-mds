@@ -456,31 +456,34 @@ def torus_delta(p, q):
     return ((q - p + 0.5) % 1.0) - 0.5
 
 
-def torus_edge_segments(p, q, eps=1e-12):
+def torus_edge_segments(p, q, offset=None, eps=1e-12):
     """
-    Return list of (a_plot, b_plot) segments for the shortest torus geodesic between p and q,
+    Return list of (a_plot, b_plot) segments for a straight torus geodesic between p and q,
     split at boundary crossings for plotting in the fundamental domain [0,1]x[0,1].
+
+    offset: optional integer pair (m, n). The geodesic then runs from p to q + (m, n) in the
+            universal cover and may wrap around any number of times. The default, None, picks
+            the shortest (minimum-image) geodesic, which wraps at most once per axis.
     """
     p = np.asarray(p, dtype=np.float64)
     q = np.asarray(q, dtype=np.float64)
 
-    d = torus_delta(p, q)
-    r = p + d
+    if offset is None:
+        d = torus_delta(p, q)
+    else:
+        d = q + np.asarray(offset, dtype=np.float64) - p
 
+    # Crossing parameters: every integer level the segment passes through, per axis.
     ts = [0.0, 1.0]
     for k in (0, 1):
         dk = d[k]
         if abs(dk) < eps:
             continue
-        if dk > 0 and r[k] > 1.0 + eps:
-            b = 1.0
-        elif dk < 0 and r[k] < 0.0 - eps:
-            b = 0.0
-        else:
-            continue
-        t = (b - p[k]) / dk
-        if eps < t < 1.0 - eps:
-            ts.append(float(t))
+        lo, hi = (p[k], p[k] + dk) if dk > 0 else (p[k] + dk, p[k])
+        for level in range(int(np.ceil(lo)), int(np.floor(hi)) + 1):
+            t = (level - p[k]) / dk
+            if eps < t < 1.0 - eps:
+                ts.append(float(t))
 
     ts = sorted(set(ts))
     segs = []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from matplotlib.patches import Polygon as MplPolygon
 
 
@@ -108,6 +109,166 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
             ax.text(lbl_pos[0], lbl_pos[1], f"{t * r1:.3g}",
                     ha='center', va='center', rotation=np.degrees(theta),
                     fontsize=8, color='dimgray')
+    return ax
+
+
+LIFT_CMAP = "tab10"
+
+
+def lift_styles(p, q, offsets, shortest_offset=None, cmap=LIFT_CMAP):
+    """
+    Line kwargs for every lift of a point pair, keyed by offset.
+
+    Colour separates the lifts from each other, which is what makes the folded view readable:
+    a geodesic that crosses a boundary is drawn as several pieces, and sharing a colour is the
+    only cue that those pieces are one line. Colours come from cmap in the order the offsets are
+    given, so an offset keeps its colour as long as the offset list does not change. A listed
+    (qualitative) cmap contributes its colours directly, a continuous one is sampled evenly with
+    the washed-out ends left off.
+
+    Line style says how far the lift wraps: solid inside the fundamental domain, dotted for up
+    to one wrap per axis, dashed beyond that. The lift at shortest_offset is thickened and drawn
+    on top of the others.
+
+    Returns a dict from offset to a record with keys offset, length and kwargs, the last ready
+    to splat into ax.plot or Line2D.
+    """
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    offsets = [(int(m), int(n)) for m, n in offsets]
+    short = None if shortest_offset is None else (int(shortest_offset[0]), int(shortest_offset[1]))
+
+    cm = plt.get_cmap(cmap)
+    if isinstance(cm, mcolors.ListedColormap) and cm.N <= 20:
+        colors = [cm(i % cm.N) for i in range(len(offsets))]
+    else:
+        colors = [cm(v) for v in np.linspace(0.1, 0.9, len(offsets))]
+
+    styles = {}
+    for offset, color in zip(offsets, colors):
+        reach = max(abs(offset[0]), abs(offset[1]))
+        if reach == 0:
+            linestyle, lw = "-", 1.6
+        elif reach == 1:
+            linestyle, lw = ":", 1.1
+        else:
+            linestyle, lw = "--", 1.3
+        zorder = 2
+        if offset == short:
+            lw *= 2.0
+            zorder = 3
+        length = float(np.linalg.norm(q + np.asarray(offset, dtype=np.float64) - p))
+        styles[offset] = dict(offset=offset, length=length,
+                              kwargs=dict(color=color, linestyle=linestyle, lw=lw, zorder=zorder))
+    return styles
+
+
+def _annotate_pair(ax, p, q, names=("p", "q"), pad=6.0, fontsize=8):
+    """
+    Label two points, each label pushed away from the centre of the tile its point sits in.
+
+    pad is in points rather than data units, so the label clears the marker by the same amount
+    whether the axes span one tile or a whole patch of the cover.
+    """
+    for point, name in zip((p, q), names):
+        away = point - np.floor(point) - 0.5
+        norm = np.linalg.norm(away)
+        direction = away / norm if norm > 1e-9 else np.array([0.0, -1.0])
+        # White backing keeps the label readable where lifts bunch up around the point.
+        ax.annotate(name, xy=point, xytext=pad * direction, textcoords="offset points",
+                    fontsize=fontsize, ha="center", va="center", zorder=6)
+
+
+def plot_torus_lifts(p, q, offsets, ax=None, shortest_offset=None, cmap=LIFT_CMAP,
+                     label_points=True, s=45, pad=0.0):
+    """
+    Draw many straight torus geodesics between two points inside the fundamental domain.
+
+    p, q:    points in [0,1)^2, in parameter space (unit square, square torus).
+    offsets: iterable of integer pairs (m, n). Each one lifts q into the tile (m, n) of the
+             universal cover, so each offset contributes one geodesic, drawn broken at every
+             boundary it crosses. On a torus these are all the geodesics joining p and q.
+    shortest_offset: offset whose lift is highlighted, typically the shortest one.
+    cmap:    colormap the per-lift colours are taken from, see lift_styles.
+    """
+    p = np.asarray(p, dtype=np.float64) % 1.0
+    q = np.asarray(q, dtype=np.float64) % 1.0
+
+    if ax is None:
+        _, ax = plt.subplots()
+
+    styles = lift_styles(p, q, offsets, shortest_offset=shortest_offset, cmap=cmap)
+    for offset, style in styles.items():
+        for a, b in torus_edge_segments(p, q, offset=offset):
+            ax.plot([a[0], b[0]], [a[1], b[1]], **style["kwargs"])
+
+    corners = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float64)
+    ax.add_patch(MplPolygon(corners, closed=True, fill=False,
+                            edgecolor="gray", lw=1.2, zorder=1))
+
+    ax.scatter([p[0], q[0]], [p[1], q[1]], s=s, c="black", zorder=5,
+               edgecolors="white", linewidths=0.8)
+    if label_points:
+        _annotate_pair(ax, p, q)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(-pad, 1 + pad)
+    ax.set_ylim(-pad, 1 + pad)
+    ax.axis("off")
+    return ax
+
+
+def plot_cover_lifts(p, q, offsets, ax=None, shortest_offset=None, cmap=LIFT_CMAP,
+                     label_points=True, label_offsets=True, s=45, pad=0.0):
+    """
+    Draw the same geodesics unbroken in the universal cover of the torus.
+
+    Each offset (m, n) puts an image of q in the tile (m, n), and the lift is then a single
+    straight line from p to that image. The fundamental domain is outlined darker than the
+    surrounding tiles. Arguments match plot_torus_lifts, which draws the folded view.
+    """
+    p = np.asarray(p, dtype=np.float64) % 1.0
+    q = np.asarray(q, dtype=np.float64) % 1.0
+    offsets = [(int(m), int(n)) for m, n in offsets]
+
+    # Tile range of the cover, always including the fundamental domain itself.
+    m_lo, m_hi = min([m for m, _ in offsets] + [0]), max([m for m, _ in offsets] + [0]) + 1
+    n_lo, n_hi = min([n for _, n in offsets] + [0]), max([n for _, n in offsets] + [0]) + 1
+
+    if ax is None:
+        _, ax = plt.subplots()
+
+    for x in range(m_lo, m_hi + 1):
+        ax.plot([x, x], [n_lo, n_hi], color="lightgray", lw=0.8, zorder=0)
+    for y in range(n_lo, n_hi + 1):
+        ax.plot([m_lo, m_hi], [y, y], color="lightgray", lw=0.8, zorder=0)
+    corners = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float64)
+    ax.add_patch(MplPolygon(corners, closed=True, fill=False,
+                            edgecolor="gray", lw=1.2, zorder=1))
+
+    styles = lift_styles(p, q, offsets, shortest_offset=shortest_offset, cmap=cmap)
+    images = np.array([q + np.asarray(o, dtype=np.float64) for o in offsets])
+    for offset, target in zip(offsets, images):
+        ax.plot([p[0], target[0]], [p[1], target[1]], **styles[offset]["kwargs"])
+        # The (0, 0) image is q itself, which already carries its own label.
+        if label_offsets and offset != (0, 0):
+            ax.text(target[0] + 0.07, target[1] - 0.05, f"q",
+                    fontsize=7, color=styles[offset]["kwargs"]["color"], ha="left", va="top", zorder=6)
+
+    # Ring each image in its own lift's colour, so the two panels are keyed the same way.
+    outer = np.array([o != (0, 0) for o in offsets])
+    ax.scatter(images[outer, 0], images[outer, 1], s=s,
+               color=[styles[o]["kwargs"]["color"] for o in offsets if o != (0, 0)],
+               linewidths=0.0, zorder=4)
+    ax.scatter([p[0], q[0]], [p[1], q[1]], s=s, c="black", zorder=5,
+               edgecolors="white", linewidths=0.8)
+    if label_points:
+        _annotate_pair(ax, p, q)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(m_lo - pad, m_hi + pad)
+    ax.set_ylim(n_lo - pad, n_hi + pad)
+    ax.axis("off")
     return ax
 
 

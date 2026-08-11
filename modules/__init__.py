@@ -35,6 +35,9 @@ from .metrics import (
 from .visualization import (
     plot_embedding_with_torus_edges,
     plot_embedding,
+    plot_torus_lifts,
+    plot_cover_lifts,
+    lift_styles,
     shepard_diagram,
 )
 from .graphio import (
