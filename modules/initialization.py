@@ -446,8 +446,8 @@ def find_fundamental_torus_directions(
     aspect_ratio = np.sqrt(lambda_2 / lambda_1)
 
     # Spectral side-length estimate: from the continuous-Laplacian identity
-    # lambda = (2pi/L)^2  =>  L = 2pi / sqrt(lambda).
-    # Gives lengths in normalised units consistent with the distance matrix D.
+    # Due to the kNN and bandwidth selection above, the scale of the spectral side
+    # lengths are arbitrary. Only their aspect ratio is correct.
     return {
         "aspect_ratio":        aspect_ratio,
         "all_eigenvalues":     evals,
