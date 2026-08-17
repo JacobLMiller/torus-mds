@@ -1,3 +1,12 @@
+"""
+TODO:
+Determine if graph is toroidal from the spectrum (eigenvalues come in pairs for first 4)
+Warm-up learning rate (start small, grow large, shrink again)
+Ensure that initialization is not destroyed...........
+Try three different sizes
+"""
+
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -253,11 +262,14 @@ def _sgd_minibatch_njit_legacy(
     Modes 5/6 use the (alpha, x, y) parametrization (x_init, y_init); modes 0-4 use
     (r0_init, r1_init, theta). Returns: (params, alpha, r0, r1, x, y).
 
-    Position step size follows an exponentially-decaying warmup on top of the
-    harmonic tail: step = lr_warmup_init * exp(-it/lr_warmup_decay) + 1/(learning_rate+it),
-    floored at 1e-4. The warmup term vanishes after a few multiples of
-    lr_warmup_decay, leaving the plain harmonic decay of the tail. Set
-    lr_warmup_init=0 to recover the old pure-harmonic schedule.
+    Position step size follows an exponentially-decaying warmup on top of a
+    harmonic tail: step = lr_warmup_init * exp(-it/lr_warmup_decay)
+    + learning_rate/(1+learning_rate*it), floored at 1e-4. learning_rate uses the
+    conventional convention (bigger = bigger steps): it's the tail's initial step
+    size (step_tail(0) == learning_rate), decaying harmonically thereafter -- the
+    equivalent of 1/(c+it) with c = 1/learning_rate. The warmup term vanishes
+    after a few multiples of lr_warmup_decay, leaving the plain harmonic decay of
+    the tail. Set lr_warmup_init=0 to recover the pure-harmonic schedule.
 
     normalize: False optimizes raw stress sum((alpha*r-d)^2); True optimizes
     normalized stress sum((alpha*r-d)^2 / d^2), i.e. each pair's term is divided
@@ -294,7 +306,8 @@ def _sgd_minibatch_njit_legacy(
 
     for it in range(max_iters):
         step_pos = max(
-            lr_warmup_init * np.exp(-it / lr_warmup_decay) + 1.0 / (learning_rate + it),
+            lr_warmup_init * np.exp(-it / lr_warmup_decay)
+            + learning_rate / (1.0 + learning_rate * it),
             1e-4,
         )
         if learn_mode == 4:
@@ -427,7 +440,8 @@ def _run_pair_sequence_online_njit(
     for it in range(epochs):
         global_it = start_iter + it
         step_pos = max(
-            lr_warmup_init * np.exp(-global_it / lr_warmup_decay) + 1.0 / (learning_rate + global_it),
+            lr_warmup_init * np.exp(-global_it / lr_warmup_decay)
+            + learning_rate / (1.0 + learning_rate * global_it),
             1e-4,
         )
         if learn_mode == 4:
@@ -475,7 +489,8 @@ def _run_pair_sequence_online_njit(
             if learn_mode == 1:
                 alpha_hat = num / (den + eps)
                 alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
-                alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
+                # alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
+                alpha = alpha_hat
             elif learn_mode == 2:
                 r = max(geom_min, r0 - geom_lr * (gr0_sum + gr1_sum) / used)
                 r0 = r
@@ -672,8 +687,9 @@ class TorusProjector:
 class MDSTorusProjector(TorusProjector):
     projection: Literal["wrap", "robust_wrap"] = "wrap"
 
-    # In the current schedule, larger learning_rate means smaller harmonic-tail
-    # steps: step_tail = 1 / (learning_rate + epoch).
+    # Conventional convention: larger learning_rate means larger harmonic-tail
+    # steps. step_tail = learning_rate / (1 + learning_rate * epoch), i.e. the
+    # tail's initial step size is learning_rate itself, decaying harmonically.
     learning_rate: float = 1
 
     def stochastic_gradient_descent(
@@ -751,9 +767,9 @@ class MDSTorusProjector(TorusProjector):
 
         if learning_rate is None or learning_rate == "auto":
             # Random starts benefit from the exploratory main-branch schedule.
-            # Supplied inits are already structured; preserve them with the old
-            # spectral-init-sized first tail step: 1 / 10 == 0.1.
-            learning_rate = 10.0 if has_init else self.learning_rate
+            # Supplied inits are already structured; preserve them with the
+            # spectral-init-sized first tail step of 0.1.
+            learning_rate = 0.1 if has_init else self.learning_rate
         elif isinstance(learning_rate, str):
             raise ValueError(f"learning_rate must be 'auto' or positive, got {learning_rate!r}")
         if lr_warmup_init is None or lr_warmup_init == "auto":
