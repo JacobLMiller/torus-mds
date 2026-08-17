@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional, Literal, Tuple
+import time
+import warnings
 
 import numpy as np
 import numba
@@ -19,6 +21,10 @@ from numba.typed import List as NumbaList
 from .geometry import (
     rect_grad,
     parallelogram_grad,
+    _torus_dist_grad_core,
+    _wrap_to_half,
+    _min_image_offset,
+    _gram_quad,
     _gauss_reduce_njit,
     lengths_angle_to_xy,
     xy_to_lengths_angle,
@@ -106,37 +112,154 @@ def _build_sampled_unique_pair_sequence_from_pairs(
     return result
 
 
-@numba.njit(cache=True, fastmath=True)
-def _batch_stress_njit(data, params, pairs, alpha, r0, r1, x, y, use_rect, eps=1e-12):
-    """
-    Normalised stress on a fixed pair sample: sum((alpha*r-d)^2) / sum(d^2).
+def _build_weighted_pair_alias(probabilities: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Walker alias table for O(1) draws from a fixed pair distribution."""
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    n = len(probabilities)
+    scaled = probabilities * n
+    accept = np.empty(n, dtype=np.float64)
+    alias = np.empty(n, dtype=np.int32)
+    small = [int(i) for i in np.flatnonzero(scaled < 1.0)]
+    large = [int(i) for i in np.flatnonzero(scaled >= 1.0)]
+    while small and large:
+        lo = small.pop()
+        hi = large.pop()
+        accept[lo] = scaled[lo]
+        alias[lo] = hi
+        scaled[hi] -= 1.0 - scaled[lo]
+        if scaled[hi] < 1.0:
+            small.append(hi)
+        else:
+            large.append(hi)
+    for i in small + large:
+        accept[i] = 1.0
+        alias[i] = i
+    return accept, alias
 
-    This is always the same summary metric, independent of whether raw or
-    normalized stress is being optimized (see ``normalize`` in rect_grad /
-    parallelogram_grad) -- it is only used as a relative-improvement signal for
-    the tol/patience early-stopping check, not as the training objective itself.
+
+def _build_weighted_pair_sequence_from_pairs(
+    pairs: np.ndarray,
+    rng: np.random.Generator,
+    epochs: int,
+    batch_pairs: int,
+    accept: np.ndarray,
+    alias: np.ndarray,
+) -> NumbaList:
+    """Sample pair batches with replacement using a precomputed alias table."""
+    total_pairs = len(pairs)
+    result = NumbaList()
+    for _ in range(epochs):
+        column = rng.integers(total_pairs, size=batch_pairs)
+        choose_alias = rng.random(batch_pairs) >= accept[column]
+        column[choose_alias] = alias[column[choose_alias]]
+        result.append(np.asarray(pairs[column], dtype=np.int32))
+    return result
+
+
+@numba.njit(cache=True, fastmath=True)
+def _batch_stress_njit(data, params, pairs, alpha, r0, r1, x, y, use_rect, eps=1e-12, normalize=False):
+    """
+    Scale-normalized value of the selected training objective on a fixed sample.
+
+    Raw stress is divided by sum(d^2). Pair-normalized stress is divided by the
+    number of sampled pairs, since its per-pair weights are 1/d^2. In either
+    case the denominator is fixed across convergence checks, so relative change
+    tracks the objective being optimized.
     """
     total_loss = 0.0
-    total_d2 = 0.0
+    total_scale = 0.0
     for k in range(pairs.shape[0]):
         i = pairs[k, 0]
         j = pairs[k, 1]
         d = data[i, j]
         if use_rect:
-            _, _, r, _, _, _ = rect_grad(params[i], params[j], d, alpha, r0, r1, eps)
+            _, _, r, _, _, w = rect_grad(params[i], params[j], d, alpha, r0, r1, eps, normalize)
         else:
-            _, _, r, _, _, _ = parallelogram_grad(params[i], params[j], d, alpha, x, y, eps)
+            _, _, r, _, _, w = parallelogram_grad(params[i], params[j], d, alpha, x, y, eps, normalize)
         diff = alpha * r - d
-        total_loss += diff * diff
-        total_d2 += d * d
-    return total_loss / (total_d2 + eps)
+        total_loss += w * diff * diff
+        total_scale += w * d * d
+    return total_loss / (total_scale + eps)
 
+
+@numba.njit(cache=True, fastmath=True)
+def _profile_alpha_njit(data, params, r0, r1, x, y, use_rect, eps=1e-12, normalize=False):
+    """Exact post-update least-squares scale for the current geometry."""
+    n = data.shape[0]
+    num = 0.0
+    den = 0.0
+    if use_rect:
+        g00 = r0 * r0
+        g11 = r1 * r1
+        for i in range(n):
+            for j in range(i + 1, n):
+                du0 = _wrap_to_half(params[j, 0] - params[i, 0])
+                du1 = _wrap_to_half(params[j, 1] - params[i, 1])
+                r = np.sqrt(max(0.0, g00 * du0 * du0 + g11 * du1 * du1)) + eps
+                d = data[i, j]
+                w = 1.0 / (d * d + eps) if normalize else 1.0
+                num += w * d * r
+                den += w * r * r
+    else:
+        g11 = x * x + y * y
+        for i in range(n):
+            for j in range(i + 1, n):
+                a = _wrap_to_half(params[j, 0] - params[i, 0])
+                b = _wrap_to_half(params[j, 1] - params[i, 1])
+                du0, du1 = _min_image_offset(a, b, 1.0, x, g11)
+                r = np.sqrt(max(0.0, _gram_quad(du0, du1, 1.0, x, g11))) + eps
+                d = data[i, j]
+                w = 1.0 / (d * d + eps) if normalize else 1.0
+                num += w * d * r
+                den += w * r * r
+    return num / (den + eps)
+
+
+@numba.njit(cache=True, fastmath=True)
+def _profile_alpha_pairs_njit(
+    data, params, pairs, r0, r1, x, y, use_rect, eps=1e-12, normalize=False,
+    sampling_gamma=0.0, sampling_correction=1.0,
+):
+    """Exact least-squares scale on one sampled pair batch."""
+    num = 0.0
+    den = 0.0
+    if use_rect:
+        g00 = r0 * r0
+        g11 = r1 * r1
+        for k in range(pairs.shape[0]):
+            i = pairs[k, 0]
+            j = pairs[k, 1]
+            du0 = _wrap_to_half(params[j, 0] - params[i, 0])
+            du1 = _wrap_to_half(params[j, 1] - params[i, 1])
+            r = np.sqrt(max(0.0, g00 * du0 * du0 + g11 * du1 * du1)) + eps
+            d = data[i, j]
+            w = 1.0 / (d * d + eps) if normalize else 1.0
+            if sampling_gamma > 0.0:
+                w *= sampling_correction * d ** (2.0 * sampling_gamma)
+            num += w * d * r
+            den += w * r * r
+    else:
+        g11 = x * x + y * y
+        for k in range(pairs.shape[0]):
+            i = pairs[k, 0]
+            j = pairs[k, 1]
+            a = _wrap_to_half(params[j, 0] - params[i, 0])
+            b = _wrap_to_half(params[j, 1] - params[i, 1])
+            du0, du1 = _min_image_offset(a, b, 1.0, x, g11)
+            r = np.sqrt(max(0.0, _gram_quad(du0, du1, 1.0, x, g11))) + eps
+            d = data[i, j]
+            w = 1.0 / (d * d + eps) if normalize else 1.0
+            if sampling_gamma > 0.0:
+                w *= sampling_correction * d ** (2.0 * sampling_gamma)
+            num += w * d * r
+            den += w * r * r
+    return num / (den + eps)
 
 
 @numba.njit(cache=True, fastmath=True)
 def _update_parallelogram_geom(
-    params, learn_mode, num, den, gx_sum, gy_sum, used,
-    alpha, x, y, y_raw, alpha_ema, alpha_min, alpha_max, geom_lr, eps,
+    params, learn_mode, gx_sum, gy_sum, used,
+    alpha, x, y, y_raw, geom_lr,
 ):
     """
     One batch geometry update for the parallelogram learn modes (alpha, x, y).
@@ -155,13 +278,9 @@ def _update_parallelogram_geom(
         y = sqrt(1 - x^2) + softplus(y_raw); a tidy step Gauss-reduces and shears
         the positions whenever |x| > 1/2.
 
-    alpha is the closed-form least-squares scale (EMA-smoothed). Returns the
-    updated (alpha, x, y, y_raw); params may be sheared in place by the tidy.
+    Returns the updated (alpha, x, y, y_raw); alpha is rescaled only when the
+    basis tidy changes coordinate units, then profiled on the completed batch.
     """
-    alpha_hat = num / (den + eps)
-    alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
-    alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
-
     base = np.sqrt(max(0.0, 1.0 - x * x))
     inv_base = x / base if base > 1e-9 else 0.0  # d(sqrt(1-x^2))/dx = -x/base
 
@@ -232,7 +351,6 @@ def _sgd_minibatch_njit_legacy(
     batch_pairs=4096,
     seed=0,
     alpha_init=1.0,
-    alpha_ema=0.05,
     eps=1e-12,
     alpha_min=1e-6,
     alpha_max=1e6,
@@ -252,7 +370,7 @@ def _sgd_minibatch_njit_legacy(
     Minibatch SGD for torus MDS on a flat parallelogram torus.
 
     learn_mode=0 ('fixed'):       positions only; geometry fixed.
-    learn_mode=1 ('alpha'):       positions + alpha via closed-form minimiser + EMA.
+    learn_mode=1 ('alpha'):       positions + alpha via per-batch closed-form profiling.
     learn_mode=2 ('square'):      positions + shared r = r0 = r1 via SGD; alpha fixed.
     learn_mode=3 ('rectangular'): positions + independent r0, r1 via SGD; alpha fixed.
     learn_mode=4 ('alpha_aspect'): positions + alpha + log-aspect.
@@ -274,8 +392,7 @@ def _sgd_minibatch_njit_legacy(
     normalize: False optimizes raw stress sum((alpha*r-d)^2); True optimizes
     normalized stress sum((alpha*r-d)^2 / d^2), i.e. each pair's term is divided
     by its own d^2 before summing. rect_grad/parallelogram_grad return the
-    per-pair weight (1, or 1/(d^2+eps)) already folded into their gradients; it is
-    reused here to weight the num/den closed-form alpha statistics consistently.
+    per-pair weight (1, or 1/(d^2+eps)) already folded into their gradients.
     """
     n = data.shape[0]
     np.random.seed(seed)
@@ -314,8 +431,6 @@ def _sgd_minibatch_njit_legacy(
             r0 = np.exp(-0.5 * log_aspect)
             r1 = np.exp(0.5 * log_aspect)
 
-        num = 0.0
-        den = 0.0
         gr0_sum = 0.0
         gr1_sum = 0.0
         gx_sum = 0.0
@@ -348,19 +463,13 @@ def _sgd_minibatch_njit_legacy(
             params[j, 0] += step_pos * g0
             params[j, 1] += step_pos * g1
 
-            num += w * d * dist
-            den += w * dist * dist
             used += 1
             drawn += 1
 
         params %= 1.0
 
         if used > 0:
-            if learn_mode == 1:
-                alpha_hat = num / (den + eps)
-                alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
-                alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
-            elif learn_mode == 2:
+            if learn_mode == 2:
                 r = max(geom_min, r0 - geom_lr * (gr0_sum + gr1_sum) / used)
                 r0 = r
                 r1 = r
@@ -368,9 +477,6 @@ def _sgd_minibatch_njit_legacy(
                 r0 = max(geom_min, r0 - geom_lr * gr0_sum / used)
                 r1 = max(geom_min, r1 - geom_lr * gr1_sum / used)
             elif learn_mode == 4:
-                alpha_hat = num / (den + eps)
-                alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
-                alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
                 grad_s = (-0.5 * gr0_sum * r0 + 0.5 * gr1_sum * r1) / used
                 log_aspect -= geom_lr * grad_s
                 if log_aspect < -6.0:
@@ -381,8 +487,8 @@ def _sgd_minibatch_njit_legacy(
                 r1 = np.exp(0.5 * log_aspect)
             elif learn_mode >= 5:
                 alpha, x, y, y_raw = _update_parallelogram_geom(
-                    params, learn_mode, num, den, gx_sum, gy_sum, used,
-                    alpha, x, y, y_raw, alpha_ema, alpha_min, alpha_max, geom_lr, eps,
+                    params, learn_mode, gx_sum, gy_sum, used,
+                    alpha, x, y, y_raw, geom_lr,
                 )
 
     return params, alpha, r0, r1, x, y
@@ -396,7 +502,6 @@ def _run_pair_sequence_online_njit(
     init,
     start_iter=0,
     alpha_init=1.0,
-    alpha_ema=0.05,
     eps=1e-12,
     alpha_min=1e-6,
     alpha_max=1e6,
@@ -411,6 +516,11 @@ def _run_pair_sequence_online_njit(
     lr_warmup_init=10.0,
     lr_warmup_decay=25.0,
     normalize=False,
+    bounded=True,
+    pair_step_cap=0.10,       # Max fractional-coordinate displacement of either endpoint per pair.
+    batch_profile_alpha=False,
+    sampling_gamma=0.0,
+    sampling_correction=1.0,
 ):
     params = init.copy()
     alpha = alpha_init
@@ -436,9 +546,15 @@ def _run_pair_sequence_online_njit(
     else:
         log_aspect = 0.0
     epochs = len(pair_sequence)
+    total_pairs = data.shape[0] * (data.shape[0] - 1) // 2
+    pairs_seen = start_iter * pair_sequence[0].shape[0]
 
     for it in range(epochs):
         global_it = start_iter + it
+        tail_progress = global_it
+        if bounded:
+            # Decay proportional to number of full pair passes, not per iteration
+            tail_progress = pairs_seen / total_pairs
         step_pos = max(
             lr_warmup_init * np.exp(-global_it / lr_warmup_decay)
             + learning_rate / (1.0 + learning_rate * global_it),
@@ -451,8 +567,6 @@ def _run_pair_sequence_online_njit(
         seq = pair_sequence[it]
         used = seq.shape[0]
 
-        num = 0.0
-        den = 0.0
         gr0_sum = 0.0
         gr1_sum = 0.0
         gx_sum = 0.0
@@ -462,6 +576,9 @@ def _run_pair_sequence_online_njit(
             j = seq[k, 1]
 
             d = data[i, j]
+            importance = 1.0
+            if sampling_gamma > 0.0:
+                importance = sampling_correction * d ** (2.0 * sampling_gamma)
             if use_rect:
                 g0, g1, dist, gr0_k, gr1_k, w = rect_grad(
                     params[i], params[j], d, alpha, r0, r1, eps, normalize
@@ -475,15 +592,62 @@ def _run_pair_sequence_online_njit(
                 gx_sum += ga
                 gy_sum += gb
 
-            params[i, 0] -= step_pos * g0
-            params[i, 1] -= step_pos * g1
-            params[j, 0] += step_pos * g0
-            params[j, 1] += step_pos * g1
+            if importance != 1.0:
+                g0 *= importance
+                g1 *= importance
+                if use_rect:
+                    gr0_sum += (importance - 1.0) * gr0_k
+                    gr1_sum += (importance - 1.0) * gr1_k
+                else:
+                    gx_sum += (importance - 1.0) * ga
+                    gy_sum += (importance - 1.0) * gb
 
-            num += w * d * dist
-            den += w * dist * dist
+            if bounded:
+                if normalize:
+                    # The raw target-distance relaxation is not scale-equivalent to the normalized gradient.
+                    # Clip the actual metric gradient step instead, preserving its alpha and 1/d^2 factors for every torus geometry.
+                    di0 = -step_pos * g0
+                    di1 = -step_pos * g1
+                    step_norm = np.sqrt(di0 * di0 + di1 * di1)
+                    if step_norm > pair_step_cap:
+                        scale = pair_step_cap / step_norm
+                        di0 *= scale
+                        di1 *= scale
+                    params[i, 0] += di0
+                    params[i, 1] += di1
+                    params[j, 0] -= di0
+                    params[j, 1] -= di1
+                else:
+                    if use_rect:
+                        du0 = params[j, 0] - params[i, 0]
+                        du1 = params[j, 1] - params[i, 1]
+                        du0 -= np.round(du0)
+                        du1 -= np.round(du1)
+                    else:
+                        _, _, _, du0, du1, _, _, _ = _torus_dist_grad_core(
+                            params[i], params[j], d, alpha, 1.0, x, x * x + y * y, eps, normalize
+                        )
+                    mu = step_pos * w * (d - alpha * dist) / (2.0 * alpha * (dist + eps))
+                    mu = min(1.0, max(-1.0, mu))
+                    di0 = -mu * du0
+                    di1 = -mu * du1
+                    step_norm = np.sqrt(di0 * di0 + di1 * di1)
+                    if step_norm > pair_step_cap:
+                        scale = pair_step_cap / step_norm
+                        di0 *= scale
+                        di1 *= scale
+                    params[i, 0] += di0
+                    params[i, 1] += di1
+                    params[j, 0] -= di0
+                    params[j, 1] -= di1
+            else:
+                params[i, 0] -= step_pos * g0
+                params[i, 1] -= step_pos * g1
+                params[j, 0] += step_pos * g0
+                params[j, 1] += step_pos * g1
 
         params %= 1.0
+        pairs_seen += used
 
         if used > 0:
             if learn_mode == 1:
@@ -499,9 +663,6 @@ def _run_pair_sequence_online_njit(
                 r0 = max(geom_min, r0 - geom_lr * gr0_sum / used)
                 r1 = max(geom_min, r1 - geom_lr * gr1_sum / used)
             elif learn_mode == 4:
-                alpha_hat = num / (den + eps)
-                alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
-                alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
                 grad_s = (-0.5 * gr0_sum * r0 + 0.5 * gr1_sum * r1) / used
                 log_aspect -= geom_lr * grad_s
                 if log_aspect < -6.0:
@@ -512,9 +673,16 @@ def _run_pair_sequence_online_njit(
                 r1 = np.exp(0.5 * log_aspect)
             elif learn_mode >= 5:
                 alpha, x, y, y_raw = _update_parallelogram_geom(
-                    params, learn_mode, num, den, gx_sum, gy_sum, used,
-                    alpha, x, y, y_raw, alpha_ema, alpha_min, alpha_max, geom_lr, eps,
+                    params, learn_mode, gx_sum, gy_sum, used,
+                    alpha, x, y, y_raw, geom_lr,
                 )
+            if batch_profile_alpha and learn_mode in (1, 4, 5, 6):
+                # Profile on the completed, wrapped batch layout.
+                alpha = _profile_alpha_pairs_njit(
+                    data, params, seq, r0, r1, x, y, use_rect, eps, normalize,
+                    sampling_gamma, sampling_correction,
+                )
+                alpha = max(alpha_min, min(alpha_max, alpha))
 
     return params, alpha, r0, r1, x, y
 
@@ -526,7 +694,6 @@ def sgd_minibatch_njit(
     batch_pairs=4096,
     seed=0,
     alpha_init=1.0,
-    alpha_ema=0.05,
     eps=1e-12,
     alpha_min=1e-6,
     alpha_max=1e6,
@@ -543,19 +710,39 @@ def sgd_minibatch_njit(
     lr_warmup_decay=25.0,
     tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
     patience: int = 5,    # non-improving chunks before stopping
+    time_limit_seconds: Optional[float] = None,
+    run_info: Optional[dict] = None,
     init=None,
     normalize=False,       # False: optimize raw stress; True: optimize normalized stress (per-pair /d^2)
+    bounded=True,
+    pair_step_cap=0.10,
+    normalized_pair_sampling="auto",
 ):
     """
-    Minibatch SGD for torus MDS using online updates over unique sampled pairs.
+    Minibatch SGD for torus MDS using online pair updates.
 
-    This replaces the older with-replacement pair sampling
+    Raw and uniform-normalized batches sample pairs without replacement. Direct
+    normalized importance batches sample with replacement from their fixed
+    target-distance distribution, with an unbiased correction.
 
     init: optional (N, 2) initial positions; wrapped to [0,1). Random if None.
 
+    The optional wall-time limit is cooperative: it is checked between sequence
+    chunks, so a running compiled chunk is allowed to finish before returning
+    the current layout. ``run_info`` is populated with the completed iteration
+    count, elapsed SGD time, time-limit status, and termination reason when
+    supplied.
+
     Returns: (params, alpha, r0, r1, x, y)
     """
+    started_at = time.perf_counter()
+    if time_limit_seconds is not None and (
+        not np.isfinite(time_limit_seconds) or time_limit_seconds <= 0.0
+    ):
+        raise ValueError("time_limit_seconds must be a finite positive number or None")
     data = np.asarray(data, dtype=np.float64)
+    if pair_step_cap <= 0.0:
+        raise ValueError("pair_step_cap must be positive")
     n = data.shape[0]
     if init is None:
         params = np.random.RandomState(seed).rand(n, 2).astype(np.float64, copy=False)
@@ -570,11 +757,42 @@ def sgd_minibatch_njit(
     x = float(x_init)
     y = float(y_init)
     if max_iters <= 0 or n < 2:
+        if run_info is not None:
+            run_info.update(
+                iterations=0,
+                time_limit_reached=False,
+                time_limit_seconds=time_limit_seconds,
+                elapsed_seconds=time.perf_counter() - started_at,
+                termination_reason="max_iters" if max_iters <= 0 else "insufficient_points",
+            )
         return params, alpha, r0, r1, x, y
 
     rng = np.random.default_rng(seed)
     pairs = _all_unique_pairs(n)
     use_rect = learn_mode <= 4 and abs(np.cos(theta)) < 1e-12
+    # Importance sampling is calibrated for the direct metric-gradient path
+    weighted_sampling = normalize and not bounded and normalized_pair_sampling == "importance"
+    sampling_gamma = 0.0
+    sampling_correction = 1.0
+    alias_accept = None
+    alias_index = None
+    if weighted_sampling:
+        pair_distances = data[pairs[:, 0], pairs[:, 1]]
+        sampling_gamma = 1.0
+        sampling_weights = pair_distances ** (-2.0 * sampling_gamma)
+        sampling_correction = float(sampling_weights.mean())
+        alias_accept, alias_index = _build_weighted_pair_alias(sampling_weights / sampling_weights.sum())
+    elif normalize and not bounded and normalized_pair_sampling == "auto":
+        pair_weights = 1.0 / (data[pairs[:, 0], pairs[:, 1]] ** 2 + eps)
+        effective_pair_fraction = (pair_weights.sum() ** 2 / np.sum(pair_weights * pair_weights)) / len(pair_weights)
+        # Empirical separation: the SuiteSparse cases are below 2.5%, whereas
+        # the current synthetic suites are above 25%; 10% selects only the
+        # strongly concentrated normalized objectives.
+        if effective_pair_fraction < 0.10:
+            weighted_sampling = True
+            sampling_gamma = 1.0
+            sampling_correction = float(pair_weights.mean())
+            alias_accept, alias_index = _build_weighted_pair_alias(pair_weights / pair_weights.sum())
 
     stress_sample = None
     bad_chunks = 0
@@ -582,13 +800,42 @@ def sgd_minibatch_njit(
     if tol > 0.0:
         num_pairs = n * (n - 1) // 2
         n_stress = min(max(256, batch_pairs), num_pairs)
-        idx = rng.choice(num_pairs, size=n_stress, replace=False)
+        stress_rng = np.random.default_rng(seed)
+        idx = stress_rng.choice(num_pairs, size=n_stress, replace=False)
         stress_sample = pairs[idx].astype(np.int32)
 
+    next_check = chunk_epochs
     start_iter = 0
+    time_limit_reached = False
+    termination_reason = None
     while start_iter < max_iters:
-        epochs = min(chunk_epochs, max_iters - start_iter)
-        sequence = _build_sampled_unique_pair_sequence_from_pairs(pairs, rng, epochs, batch_pairs)
+        if time_limit_seconds is not None and time.perf_counter() - started_at >= time_limit_seconds:
+            time_limit_reached = True
+            termination_reason = "time_limit"
+            break
+        until_check = next_check - start_iter if tol > 0.0 else max_iters - start_iter
+        epochs = min(chunk_epochs, until_check, max_iters - start_iter)
+        if weighted_sampling:
+            sequence = _build_weighted_pair_sequence_from_pairs(
+                pairs, rng, epochs, batch_pairs, alias_accept, alias_index
+            )
+        else:
+            sequence = _build_sampled_unique_pair_sequence_from_pairs(pairs, rng, epochs, batch_pairs)
+        if time_limit_seconds is not None and time.perf_counter() - started_at >= time_limit_seconds:
+            time_limit_reached = True
+            termination_reason = "time_limit"
+            break
+        # The first bounded update uses a scale-consistent profile of its
+        # sampled pair batch; every later batch is profiled after its update.
+        if start_iter == 0 and bounded and learn_mode in (1, 4, 5, 6):
+            alpha = _profile_alpha_pairs_njit(
+                data, params, sequence[0], r0, r1, x, y, use_rect, eps, normalize
+            )
+            alpha = max(alpha_min, min(alpha_max, alpha))
+        if time_limit_seconds is not None and time.perf_counter() - started_at >= time_limit_seconds:
+            time_limit_reached = True
+            termination_reason = "time_limit"
+            break
         params, alpha, r0, r1, x, y = _run_pair_sequence_online_njit(
             data=data,
             pair_sequence=sequence,
@@ -596,7 +843,6 @@ def sgd_minibatch_njit(
             init=params,
             start_iter=start_iter,
             alpha_init=alpha,
-            alpha_ema=alpha_ema,
             eps=eps,
             alpha_min=alpha_min,
             alpha_max=alpha_max,
@@ -611,20 +857,47 @@ def sgd_minibatch_njit(
             lr_warmup_init=lr_warmup_init,
             lr_warmup_decay=lr_warmup_decay,
             normalize=normalize,
+            bounded=bounded,
+            pair_step_cap=pair_step_cap,
+            batch_profile_alpha=True,
+            sampling_gamma=sampling_gamma,
+            sampling_correction=sampling_correction,
         )
         start_iter += epochs
+        if (
+            start_iter < max_iters
+            and time_limit_seconds is not None
+            and time.perf_counter() - started_at >= time_limit_seconds
+        ):
+            time_limit_reached = True
+            termination_reason = "time_limit"
+            break
 
-        if tol > 0.0:
-            curr_stress = _batch_stress_njit(data, params, stress_sample, alpha, r0, r1, x, y, use_rect, eps)
+        if tol > 0.0 and start_iter == next_check:
+            curr_stress = _batch_stress_njit(
+                data, params, stress_sample, alpha, r0, r1, x, y, use_rect, eps, normalize
+            )
             rel_change = abs(prev_stress - curr_stress) / max(prev_stress, 1e-12)
             if rel_change < tol:
                 bad_chunks += 1
                 if bad_chunks >= patience:
+                    termination_reason = "tolerance"
                     break
             else:
                 bad_chunks = 0
             prev_stress = curr_stress
+            next_check += chunk_epochs
 
+    if termination_reason is None:
+        termination_reason = "max_iters"
+    if run_info is not None:
+        run_info.update(
+            iterations=start_iter,
+            time_limit_reached=time_limit_reached,
+            time_limit_seconds=time_limit_seconds,
+            elapsed_seconds=time.perf_counter() - started_at,
+            termination_reason=termination_reason,
+        )
     return params, alpha, r0, r1, x, y
 
 
@@ -653,6 +926,11 @@ class TorusProjector:
     x_: Optional[float] = field(default=None, init=False)
     y_: Optional[float] = field(default=None, init=False)
     finalization_info_: dict = field(default_factory=lambda: {"mode": None}, init=False)
+    time_limit_reached_: bool = field(default=False, init=False)
+    time_limit_seconds_: Optional[float] = field(default=None, init=False)
+    sgd_elapsed_seconds_: Optional[float] = field(default=None, init=False)
+    n_iter_: Optional[int] = field(default=None, init=False)
+    termination_reason_: Optional[str] = field(default=None, init=False)
 
     def fit_transform(self, D: np.ndarray, **kwargs) -> np.ndarray:
         D = _check_distance_matrix(D)
@@ -715,18 +993,58 @@ class MDSTorusProjector(TorusProjector):
             # --- convergence criteria (sampled_unique path only) ---
             tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
             patience: int = 5,    # non-improving chunks before stopping
+            # Cooperative sampled-unique SGD wall-time budget; L-BFGS polishing
+            # is skipped when set because SciPy cannot be stopped safely mid-run.
+            time_limit_seconds: Optional[float] = None,
             finalize: Literal[None, "none", "lbfgs"] = None,
             finalize_iters: int = 50,
             finalize_options: Optional[dict] = None,
             # 'raw': minimize sum((alpha*r-d)^2). 'normalized': minimize
             # sum((alpha*r-d)^2 / d^2) -- each pair's term is divided by its own
             # d^2 before summing (not a single division after summing).
-            stress_mode: Literal["raw", "normalized"] = "normalized",
+            stress_mode: Literal["raw", "normalized"] = "raw",
+            coordinate_update: Literal["bounded", "gradient"] | None = None,
+            pair_step_cap: float = 0.10,
+            normalized_pair_sampling: Literal["auto", "importance", "uniform"] = "auto",
     ):
         if not (60.0 <= theta <= 120.0):
             raise ValueError(f"theta must be in [60, 120] degrees, got {theta}")
         if stress_mode not in ("raw", "normalized"):
             raise ValueError(f"stress_mode must be 'raw' or 'normalized', got {stress_mode!r}")
+        if normalized_pair_sampling not in ("auto", "importance", "uniform"):
+            raise ValueError(
+                "normalized_pair_sampling must be 'auto', 'importance', or 'uniform', "
+                f"got {normalized_pair_sampling!r}"
+            )
+        if coordinate_update is None:
+            coordinate_update = "gradient" if stress_mode == "normalized" else "bounded"
+        if coordinate_update not in ("bounded", "gradient"):
+            raise ValueError(
+                "coordinate_update must be 'bounded' or 'gradient', "
+                f"got {coordinate_update!r}"
+            )
+        if normalized_pair_sampling == "importance" and (
+            stress_mode != "normalized" or coordinate_update != "gradient" or not sampled_unique
+        ):
+            raise ValueError(
+                "normalized_pair_sampling='importance' requires sampled_unique direct "
+                "normalized-gradient optimization"
+            )
+        if pair_step_cap <= 0.0:
+            raise ValueError(f"pair_step_cap must be positive, got {pair_step_cap}")
+        if time_limit_seconds is not None and (
+            not np.isfinite(time_limit_seconds) or time_limit_seconds <= 0.0
+        ):
+            raise ValueError("time_limit_seconds must be a finite positive number or None")
+        if time_limit_seconds is not None and not sampled_unique:
+            raise ValueError("time_limit_seconds requires sampled_unique=True")
+        if time_limit_seconds is not None and finalize == "lbfgs":
+            warnings.warn(
+                "time_limit_seconds skips L-BFGS polishing because it cannot be "
+                "safely interrupted; the returned layout is the current SGD result.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         normalize = stress_mode == "normalized"
         has_init = init is not None
         mode_int = {
@@ -803,6 +1121,7 @@ class MDSTorusProjector(TorusProjector):
 
         alpha_kernel = alpha_init * r0_init if non_orth_rect else alpha_init
 
+        run_info = {}
         kwargs = dict(
             data=data,
             learning_rate=learning_rate,
@@ -822,20 +1141,42 @@ class MDSTorusProjector(TorusProjector):
             normalize=normalize,
         )
         if sampled_unique:
-            sgd_fn = sgd_minibatch_njit  # sample pairs without replacement; supports early stopping
+            sgd_fn = sgd_minibatch_njit  # uniform raw / importance-sampled normalized pairs
             kwargs["tol"] = tol
             kwargs["patience"] = patience
+            kwargs["time_limit_seconds"] = time_limit_seconds
+            kwargs["run_info"] = run_info
             kwargs["init"] = init
+            kwargs["bounded"] = coordinate_update == "bounded"
+            kwargs["pair_step_cap"] = pair_step_cap
+            kwargs["normalized_pair_sampling"] = normalized_pair_sampling
         else:
             if init is not None:
                 raise ValueError("init is only supported with sampled_unique=True")
             sgd_fn = _sgd_minibatch_njit_legacy  # sample pairs with replacement; no early stopping
 
         coords, alpha, r0, r1, x, y = sgd_fn(**kwargs)
+        if not sampled_unique and mode_int in (1, 4, 5, 6):
+            use_rect = mode_int <= 4 and abs(np.cos(theta_rad)) < 1e-12
+            alpha = _profile_alpha_njit(data, coords, r0, r1, x, y, use_rect, normalize=normalize)
 
-        final_info = {"mode": None}
+        self.time_limit_reached_ = bool(run_info.get("time_limit_reached", False))
+        self.time_limit_seconds_ = time_limit_seconds
+        self.sgd_elapsed_seconds_ = run_info.get("elapsed_seconds")
+        self.n_iter_ = run_info.get("iterations")
+        self.termination_reason_ = run_info.get("termination_reason")
+        final_info = {
+            "mode": None,
+            "time_limit_reached": self.time_limit_reached_,
+            "time_limit_seconds": time_limit_seconds,
+            "sgd_elapsed_seconds": self.sgd_elapsed_seconds_,
+            "sgd_n_iter": self.n_iter_,
+            "termination_reason": self.termination_reason_,
+        }
         if finalize in (None, "none"):
             pass
+        elif finalize == "lbfgs" and time_limit_seconds is not None:
+            final_info["finalization_skipped"] = "time_limit"
         elif finalize == "lbfgs":
             from .exact_torus_stress import polish_torus_layout
 
@@ -857,7 +1198,12 @@ class MDSTorusProjector(TorusProjector):
             x = result.x
             y = result.y_shape
             theta_rad = result.theta
-            final_info = {"mode": "lbfgs", **result.convergence_info, "n_iter": result.n_iter}
+            final_info = {
+                **final_info,
+                "mode": "lbfgs",
+                **result.convergence_info,
+                "n_iter": result.n_iter,
+            }
         else:
             raise ValueError("finalize must be None, 'none', or 'lbfgs'")
 
