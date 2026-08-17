@@ -170,10 +170,21 @@ size, 100x (409600) batch size}. These are just four more `method` values
 (`TorusMDS_smart_1x`, `TorusMDS_smart_100x`, `TorusMDS_random_1x`,
 `TorusMDS_random_100x`, defined in `modules/experiment_runner.py`'s
 `ASPECT_INIT_VARIANTS`) -- no new sbatch script needed, `run_embed_array.sbatch`
-already forwards whatever `METHODS` you export. They land in the same
-`layouts/<family>/...` / `runs.csv` / `results/*_comparison.csv` outputs as
-section 1, distinguished only by the `method` column, so the same metrics
-(step 2) and merge (step 3) commands below pick them up unmodified.
+already forwards whatever `METHODS` you export.
+
+**This experiment trains with `STRESS_MODE=normalized`** (minimizes
+`sum((alpha*r-d)^2 / d^2)`, each pair weighted by its own `1/d^2`), not
+section 1's `raw` default -- set the env var below, don't leave it unset.
+Because it deviates from the `(raw, 2000-iter)` default, `run_embed_array.sbatch`
+routes it to a distinctly-suffixed `layouts/<family>_normalized/...` (not
+plain `layouts/<family>/...`) so it can't collide with, or get silently
+skipped as already-done against, any `raw`-mode manifest from section 1 at
+the same family/tier. Point the metrics phase (step 2) at that same
+suffixed name via `FAMILY_SUBDIR=<family>_normalized`, and glob
+`results/<family>_normalized_*_comparison.csv` in the merge step (step 3) --
+both shown below. Normalized stress also flips `coordinate_update` from
+`bounded` to `gradient` internally (`modules/projector.py:1015`), i.e. this
+isn't just a reweighting -- it changes the per-pair step mechanism too.
 
 Six methods per graph (vs. three above) means roughly double the per-shard
 cost, so this uses smaller, decreasing `GRAPHS_PER_SHARD` per size tier --
@@ -194,42 +205,85 @@ GRG here is restricted to Euclidean + toroidal only (no spherical):
 shell variable rather than putting it inside `--export=ALL,...` (its commas
 would otherwise be split by `sbatch --export` itself).
 
+**Core budget.** Each array task requests `--cpus-per-task=2` (the repo's
+existing convention -- one core for the numba-jitted SGD/BFS loop, one of
+headroom for `s_gd2`/scipy's BLAS threads). Submitting every tier/family
+below unthrottled and simultaneously would ask for up to 76 cores at once
+(38 array tasks x 2 cores) on a shared cluster partition -- rude, and likely
+to get deprioritized by fair-share scheduling anyway. To cap this at a
+polite ~24 cores concurrently:
+
+- **GRG's 3 tiers run one at a time** (`--dependency=singleton`, all sharing
+  `--job-name=torus-embed-grg`): singleton makes a submission wait for any
+  earlier job with the same name *and user* to finish first, so submitting
+  tier 1 then tier 2 then tier 3 in order serializes them automatically --
+  at most one GRG tier (3 shards x 2 cores = 6 cores) runs at a time.
+- **SBM's 3 tiers do the same** under their own `--job-name=torus-embed-sbm`
+  chain (6 cores), running *in parallel with* the GRG chain since the two
+  job names don't share a singleton group.
+- **SuiteSparse's 20-shard array is throttled in place** via the `%6` array
+  suffix (`--array=0-19%6`) instead of serialized -- at most 6 of its 20
+  shards run concurrently (12 cores), rather than one at a time, since it's
+  a single job array, not several tiers.
+
+Worst case: 6 (GRG) + 6 (SBM) + 12 (SuiteSparse) = 24 cores at once. Raise
+or lower the `%6` (and/or add `%K` to the GRG/SBM tiers' own `--array=0-2`
+if you want more than one tier per family running at once) to trade cores
+for wall-clock time -- lower concurrency finishes later since e.g. GRG's
+3 serialized tiers now take roughly the *sum* of their `--time` budgets
+back-to-back (~7.5h worst-case here) rather than running side by side.
+
 ```bash
 cd ~/nobackup/torus-mds   # repo root
 mkdir -p slurm_logs
 
 export METHODS="TorusMDS_smart_1x TorusMDS_smart_100x TorusMDS_random_1x TorusMDS_random_100x s_gd2 wrap_python"
+export STRESS_MODE=normalized
 
-# --- GRG (Euclidean + toroidal only) ---
+# --- GRG (Euclidean + toroidal only), 3 tiers serialized via singleton ---
 export GRAPH_TYPE_WEIGHTS="1,1,0"
-sbatch --array=0-2 --time=00:30:00 --mem=2G \
+sbatch --job-name=torus-embed-grg --dependency=singleton --array=0-2 --time=00:30:00 --mem=2G \
     --export=ALL,FAMILY=grg,N_MIN=100,N_MAX=1000,GRAPHS_PER_SHARD=150 \
     verification_experiments/slurm/run_embed_array.sbatch
-sbatch --array=0-2 --time=02:00:00 --mem=4G \
+sbatch --job-name=torus-embed-grg --dependency=singleton --array=0-2 --time=02:00:00 --mem=4G \
     --export=ALL,FAMILY=grg,N_MIN=1000,N_MAX=3000,GRAPHS_PER_SHARD=60 \
     verification_experiments/slurm/run_embed_array.sbatch
-sbatch --array=0-2 --time=05:00:00 --mem=8G \
+sbatch --job-name=torus-embed-grg --dependency=singleton --array=0-2 --time=05:00:00 --mem=8G \
     --export=ALL,FAMILY=grg,N_MIN=3000,N_MAX=10000,GRAPHS_PER_SHARD=20 \
     verification_experiments/slurm/run_embed_array.sbatch
 unset GRAPH_TYPE_WEIGHTS
 
-# --- SBM (same 3 tiers, same decreasing GRAPHS_PER_SHARD) ---
-sbatch --array=0-2 --time=00:30:00 --mem=2G \
+# --- SBM, 3 tiers serialized via singleton (own job-name -> runs
+#     alongside the GRG chain above, not queued behind it) ---
+sbatch --job-name=torus-embed-sbm --dependency=singleton --array=0-2 --time=00:30:00 --mem=2G \
     --export=ALL,FAMILY=sbm,N_MIN=100,N_MAX=1000,GRAPHS_PER_SHARD=150 \
     verification_experiments/slurm/run_embed_array.sbatch
-sbatch --array=0-2 --time=02:00:00 --mem=4G \
+sbatch --job-name=torus-embed-sbm --dependency=singleton --array=0-2 --time=02:00:00 --mem=4G \
     --export=ALL,FAMILY=sbm,N_MIN=1000,N_MAX=3000,GRAPHS_PER_SHARD=60 \
     verification_experiments/slurm/run_embed_array.sbatch
-sbatch --array=0-2 --time=05:00:00 --mem=8G \
+sbatch --job-name=torus-embed-sbm --dependency=singleton --array=0-2 --time=05:00:00 --mem=8G \
     --export=ALL,FAMILY=sbm,N_MIN=3000,N_MAX=10000,GRAPHS_PER_SHARD=20 \
     verification_experiments/slurm/run_embed_array.sbatch
 
 # --- SuiteSparse (fixed staged pool, already spans 100-10,000 with
-#     naturally fewer large matrices; sharded by interleaving as usual) ---
-sbatch --array=0-19 --time=02:00:00 --mem=4G \
+#     naturally fewer large matrices; sharded by interleaving as usual,
+#     throttled to 6 concurrent shards instead of serialized) ---
+sbatch --job-name=torus-embed-ss --array=0-19%6 --time=02:00:00 --mem=4G \
     --export=ALL,FAMILY=suitesparse,NUM_SHARDS=20 \
     verification_experiments/slurm/run_embed_array.sbatch
 ```
+
+Note the `--job-name=...` on the `sbatch` command line overrides the
+`#SBATCH --job-name=torus-embed` default baked into `run_embed_array.sbatch`
+-- that's required here since `singleton` groups purely by name, and section
+1's plain `learn_mode='alpha'` runs (if submitted separately) still use the
+script's unmodified default name, so they won't accidentally join either of
+these singleton chains.
+
+Track progress with `squeue -u $USER` and `sacct -j <jobid> --format=JobID,Elapsed,State`.
+If you want the GRG/SBM chains to run one after another instead of side by
+side (12 cores lower peak, longer total time), give them the *same*
+`--job-name` instead of two different ones.
 
 ## 2. Submit metrics jobs (after the embed jobs finish)
 
@@ -245,7 +299,30 @@ sbatch --dependency=afterok:<embed_job_id> --array=0-$((N-1)) \
     verification_experiments/slurm/run_metrics_array.sbatch
 ```
 
-Repeat for `grg` and `suitesparse`. This phase used to have a much worse
+For section 1b's normalized-stress runs, output lives under the suffixed
+`layouts/<family>_normalized/` dir (see section 1b) instead of plain
+`layouts/<family>/`, so pass that as `FAMILY_SUBDIR` (defaults to `$FAMILY`
+if unset, which is what the plain example above relies on):
+
+```bash
+find layouts/sbm_normalized -mindepth 1 -name runs.csv | wc -l   # -> N
+
+sbatch --dependency=afterok:<embed_job_id> --array=0-$((N-1)) \
+    --time=00:40:00 --mem=2G --export=ALL,FAMILY=sbm,FAMILY_SUBDIR=sbm_normalized \
+    verification_experiments/slurm/run_metrics_array.sbatch
+```
+
+Repeat both forms (plain and `_normalized`) for `grg` and `suitesparse`. If
+a family's embed phase was submitted as a singleton chain (section 1b),
+`<embed_job_id>` should be the *last* tier's job id (e.g. GRG tier 3) --
+singleton guarantees tiers 1 and 2 already
+finished by the time tier 3 starts, so `afterok` on tier 3 alone is enough
+to know the whole family's shards are ready to score. Give the metrics
+array its own modest `%K` too (e.g. `--array=0-$((N-1))%8`) if you want to
+keep it inside the same core budget as the embed phase, rather than letting
+it burst to `N` concurrent tasks.
+
+This phase used to have a much worse
 bottleneck than APSP: `estimate_alpha` (the torus scale-factor fit) is an
 unvectorized O(k^2) Python loop, and it was being run on the *full*
 unsampled layout instead of the same subsample used for the other metrics
@@ -258,17 +335,40 @@ before alpha estimation, not after), so the phase is genuinely cheap again
 
 ## 3. Merge
 
+Shard CSV names are `<FAMILY_SUBDIR>_<...>_comparison.csv`, so a plain
+`sbm_*_comparison.csv` glob would also sweep up `sbm_normalized_*` shards
+now that section 1b can produce those too -- anchor the plain-family globs
+so they only match a digit (GRG/SBM: `n_min` right after the family name) or
+the literal `shard_` (SuiteSparse has no tier prefix), which `_normalized`
+shard names never do:
+
 ```bash
 python verification_experiments/slurm/merge_results.py \
-    --glob "results/sbm_*_comparison.csv" --output results/sbm_comparison.csv
+    --glob "results/sbm_[0-9]*_comparison.csv" --output results/sbm_comparison.csv
 
 python verification_experiments/slurm/merge_results.py \
-    --glob "results/grg_*_comparison.csv" --output results/grg_comparison.csv
+    --glob "results/grg_[0-9]*_comparison.csv" --output results/grg_comparison.csv
 
 python verification_experiments/slurm/merge_results.py \
-    --glob "results/suitesparse_*_comparison.csv" --output results/suitesparse_comparison.csv
+    --glob "results/suitesparse_shard_*_comparison.csv" --output results/suitesparse_comparison.csv
 ```
 
 `results/sbm_comparison.csv` and `results/grg_comparison.csv` land in the
 same schema the original all-in-one scripts produced, so
 `sbm_results.ipynb` / `grg_results.ipynb` work unmodified.
+
+For section 1b's normalized-stress runs, merge separately into their own
+`*_normalized_comparison.csv` files rather than mixing them into the plain
+merges above (different `stress_mode`, and the new `TorusMDS_*` methods make
+these rows a different comparison than section 1's):
+
+```bash
+python verification_experiments/slurm/merge_results.py \
+    --glob "results/sbm_normalized_*_comparison.csv" --output results/sbm_normalized_comparison.csv
+
+python verification_experiments/slurm/merge_results.py \
+    --glob "results/grg_normalized_*_comparison.csv" --output results/grg_normalized_comparison.csv
+
+python verification_experiments/slurm/merge_results.py \
+    --glob "results/suitesparse_normalized_shard_*_comparison.csv" --output results/suitesparse_normalized_comparison.csv
+```

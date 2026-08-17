@@ -28,6 +28,19 @@ SEED_BASE="${SEED_BASE:-0}"
 STRESS_MODE="${STRESS_MODE:-raw}"
 METHODS="${METHODS:-TorusMDS s_gd2 wrap_python}"
 
+# Runs that deviate from the (raw, 2000-iter) default land in a
+# distinctly-named layouts/ subdir so they don't collide with -- or get
+# skipped as already-done against -- manifests from a different
+# configuration on the same graphs (e.g. a normalized-stress or
+# iteration-count ablation sharing the same FAMILY/N_MIN/N_MAX).
+FAMILY_SUBDIR="$FAMILY"
+if [ "$STRESS_MODE" != "raw" ]; then
+  FAMILY_SUBDIR="${FAMILY_SUBDIR}_${STRESS_MODE}"
+fi
+if [ "$TORUS_MAX_ITERS" != "2000" ]; then
+  FAMILY_SUBDIR="${FAMILY_SUBDIR}_iters${TORUS_MAX_ITERS}"
+fi
+
 case "$FAMILY" in
   sbm)
     N_MIN="${N_MIN:?Set N_MIN via --export}"
@@ -37,9 +50,10 @@ case "$FAMILY" in
       --n-graphs "$GRAPHS_PER_SHARD" \
       --n-min "$N_MIN" --n-max "$N_MAX" \
       --torus-max-iters "$TORUS_MAX_ITERS" \
+      --stress-mode "$STRESS_MODE" \
       --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
       --methods $METHODS \
-      --output-dir "layouts/sbm/${N_MIN}_${N_MAX}/shard_${SHARD}" \
+      --output-dir "layouts/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}" \
       --seed "$((SEED_BASE + SHARD))"
     ;;
   grg)
@@ -52,24 +66,14 @@ case "$FAMILY" in
       --n-min "$N_MIN" --n-max "$N_MAX" \
       --graph-type-weights "$GRAPH_TYPE_WEIGHTS" \
       --torus-max-iters "$TORUS_MAX_ITERS" \
+      --stress-mode "$STRESS_MODE" \
       --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
       --methods $METHODS \
-      --output-dir "layouts/grg/${N_MIN}_${N_MAX}/shard_${SHARD}" \
+      --output-dir "layouts/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}" \
       --seed "$((SEED_BASE + SHARD))"
     ;;
   suitesparse)
     NUM_SHARDS="${NUM_SHARDS:?Set NUM_SHARDS via --export (must match --array size)}"
-    # Runs that deviate from the (raw, 2000-iter) default land in a
-    # distinctly-named layouts/ subdir so they don't collide with -- or get
-    # skipped as already-done against -- manifests from a different
-    # configuration on the same graphs (e.g. an iteration-count ablation).
-    OUTPUT_SUBDIR="suitesparse"
-    if [ "$STRESS_MODE" != "raw" ]; then
-      OUTPUT_SUBDIR="${OUTPUT_SUBDIR}_${STRESS_MODE}"
-    fi
-    if [ "$TORUS_MAX_ITERS" != "2000" ]; then
-      OUTPUT_SUBDIR="${OUTPUT_SUBDIR}_iters${TORUS_MAX_ITERS}"
-    fi
     python verification_experiments/suitesparse_comparison.py \
       --cache-dir "${SUITESPARSE_CACHE_DIR:-data/suitesparse_cache}" \
       --shard-index "$SHARD" --num-shards "$NUM_SHARDS" \
@@ -77,7 +81,7 @@ case "$FAMILY" in
       --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
       --stress-mode "$STRESS_MODE" \
       --methods $METHODS \
-      --output-dir "layouts/${OUTPUT_SUBDIR}/shard_${SHARD}"
+      --output-dir "layouts/${FAMILY_SUBDIR}/shard_${SHARD}"
     ;;
   *)
     echo "Unknown FAMILY=$FAMILY (expected sbm|grg|suitesparse)" >&2

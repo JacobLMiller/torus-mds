@@ -95,6 +95,9 @@ if __name__ == "__main__":
                         help="Maximum number of SBM blocks (default: 8)")
     parser.add_argument("--torus-max-iters", type=int, default=2000,
                         help="SGD iterations for TorusMDS (default: 2000)")
+    parser.add_argument("--stress-mode", type=str, default="raw", choices=["raw", "normalized"],
+                        help="TorusMDS training objective: 'raw' minimizes sum((alpha*r-d)^2), "
+                             "'normalized' minimizes sum((alpha*r-d)^2 / d^2) (default: raw)")
     parser.add_argument("--methods", type=str, nargs="+", default=list(METHODS),
                         choices=list(METHODS) + list(ASPECT_INIT_VARIANTS),
                         help=f"Which methods to run, space-separated (default: all of {list(METHODS)}; "
@@ -131,4 +134,5 @@ if __name__ == "__main__":
         checkpoint_every=args.checkpoint_every,
         seed=args.seed,
         methods=tuple(args.methods),
+        torus_stress_mode=args.stress_mode,
     )
