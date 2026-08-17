@@ -70,7 +70,7 @@ def compute_metrics(X: np.ndarray, D: np.ndarray, geod, rg: float = 2.0) -> dict
     )
 
 
-def _geod_for(method: str, X: np.ndarray, D: np.ndarray):
+def _geod_for(method: str, X: np.ndarray, D: np.ndarray, r0: float = 1.0, r1: float = 1.0):
     # Re-estimate scale on the same (already subsampled) points used for the
     # metrics below, not the full graph -- estimate_alpha is an unvectorized
     # O(k^2) Python loop (like every other metric here), and at n=10,000
@@ -79,11 +79,18 @@ def _geod_for(method: str, X: np.ndarray, D: np.ndarray):
     # methods) keeps stress comparable across methods -- an unscaled
     # Euclidean embedding's raw distances are an arbitrary size, so without
     # this the stress numbers aren't on the same footing.
+    #
+    # r0/r1 default to 1 (unit-square torus), correct for learn_mode='alpha'
+    # (the only mode plain TorusMDS/wrap_python use). learn_mode='alpha_aspect'
+    # variants learn a non-square aspect ratio, so their fitted r0_/r1_ must be
+    # passed in -- positions are always wrapped to the unit square
+    # (MDSTorusProjector._project_to_torus), but the *metric* on that square
+    # depends on the learned side lengths.
     if method == "s_gd2":
         alpha = estimate_alpha(X, D, geod=euc_distance)
         return (lambda p, q, a=alpha: a * euc_distance(p, q)), alpha
-    alpha = estimate_alpha(X, D)
-    return (lambda p, q, a=alpha: a * torus_distance(p, q)), alpha
+    alpha = estimate_alpha(X, D, r0=r0, r1=r1)
+    return (lambda p, q, a=alpha, r0=r0, r1=r1: a * torus_distance(p, q, r0=r0, r1=r1)), alpha
 
 
 def run_metrics(
@@ -134,9 +141,14 @@ def run_metrics(
             method = row["method"]
             meta = {k: v for k, v in row.items() if k not in _MANIFEST_ONLY_COLUMNS}
             try:
+                r0 = row.get("r0_fit", 1.0)
+                r1 = row.get("r1_fit", 1.0)
+                r0 = 1.0 if pd.isna(r0) else float(r0)
+                r1 = 1.0 if pd.isna(r1) else float(r1)
+
                 X = np.load(coords_path(layouts_dir, int(exp_idx), method))
                 X_s, D_s = _subsample(X, D, metric_subsample)
-                geod, alpha = _geod_for(method, X_s, D_s)
+                geod, alpha = _geod_for(method, X_s, D_s, r0=r0, r1=r1)
                 metrics = compute_metrics(X_s, D_s, geod, rg=np_radius)
                 records.append({**meta, "t_spd": round(t_spd, 4), **metrics, "alpha": round(alpha, 6) if np.isfinite(alpha) else alpha})
                 done.add((int(exp_idx), method))

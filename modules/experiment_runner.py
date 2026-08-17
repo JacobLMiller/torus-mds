@@ -15,6 +15,7 @@ import scipy.sparse as sp
 from standalone_toruslayout import wrap_python
 
 from .graphio import apsp_distance_matrix
+from .initialization import find_fundamental_torus_directions
 from .projector import MDSTorusProjector
 
 # ---------------------------------------------------------------------------
@@ -28,6 +29,19 @@ DEFAULT_METHOD_MAX_N: dict[str, int | None] = {
     "s_gd2": None,
     "wrap_python": 3500,
 }
+
+# learn_mode='alpha_aspect' variants: {smart spectral init, random init} x
+# {default batch size, 100x batch size}. Kept separate from METHODS (not
+# merged into it) so existing scripts' default `--methods` behavior is
+# unchanged -- these are opt-in via an explicit --methods list.
+ASPECT_INIT_VARIANTS: dict[str, tuple[str, int]] = {
+    "TorusMDS_smart_1x": ("smart", 1),
+    "TorusMDS_smart_100x": ("smart", 100),
+    "TorusMDS_random_1x": ("random", 1),
+    "TorusMDS_random_100x": ("random", 100),
+}
+
+DEFAULT_ASPECT_MAX_N: dict[str, int | None] = {name: None for name in ASPECT_INIT_VARIANTS}
 
 
 @dataclass
@@ -61,6 +75,51 @@ def embed_torus_mds(
     proj = MDSTorusProjector(projection="wrap")
     X = proj.fit_transform(D, max_iters=max_iters, seed=seed, stress_mode=stress_mode)
     return X, float(proj.alpha_)
+
+
+def embed_torus_mds_aspect(
+    D: np.ndarray,
+    init_mode: str,
+    batch_multiplier: int,
+    spectral_result: dict | None = None,
+    max_iters: int = 2000,
+    seed: int = 42,
+    stress_mode: str = "raw",
+) -> tuple[np.ndarray, float, float, float]:
+    """
+    learn_mode='alpha_aspect' TorusMDS: jointly learns alpha and the aspect
+    ratio (r0, r1), instead of the fixed unit-square torus of embed_torus_mds.
+
+    init_mode="smart" requires D normalized to max 1 (the projector's
+    spectral-dict init check) and uses spectral_result (from
+    find_fundamental_torus_directions(D / D.max()), passed in so callers can
+    compute/cache it once per graph and share it across batch-size variants).
+    init_mode="random" uses D as-is (matching embed_torus_mds) and init=None.
+
+    learning_rate is left at "auto" so the projector's has-init-dependent
+    schedule applies: a smaller tail step with no warmup for the supplied
+    spectral init, vs. the default tail step with a warmup for random init.
+    """
+    if init_mode == "smart":
+        data = D / D.max()
+        init = spectral_result
+    elif init_mode == "random":
+        data = D
+        init = None
+    else:
+        raise ValueError(f"Unknown init_mode {init_mode!r}")
+
+    proj = MDSTorusProjector(projection="wrap")
+    X = proj.fit_transform(
+        data,
+        max_iters=max_iters,
+        seed=seed,
+        stress_mode=stress_mode,
+        learn_mode="alpha_aspect",
+        batch_size=4096 * batch_multiplier,
+        init=init,
+    )
+    return X, float(proj.alpha_), float(proj.r0_), float(proj.r1_)
 
 
 def embed_wrap_python(
@@ -126,7 +185,7 @@ def run_embeddings(
     methods: tuple[str, ...] = METHODS,
     torus_stress_mode: str = "raw",
 ) -> pd.DataFrame:
-    method_max_n = {**DEFAULT_METHOD_MAX_N, **(method_max_n or {})}
+    method_max_n = {**DEFAULT_METHOD_MAX_N, **DEFAULT_ASPECT_MAX_N, **(method_max_n or {})}
 
     os.makedirs(_graphs_dir(output_dir), exist_ok=True)
     os.makedirs(_coords_dir(output_dir), exist_ok=True)
@@ -161,39 +220,67 @@ def run_embeddings(
         if not os.path.exists(gpath):
             save_graph(G, gpath)
 
+        # Shared, lazily-computed per-graph state: D (shortest-path distances)
+        # is needed by TorusMDS and every aspect-init variant, and the spectral
+        # decomposition is needed by both "smart" variants -- compute each at
+        # most once per graph instead of once per method that needs it.
+        D: np.ndarray | None = None
+        spectral_result: dict | None = None
+        spectral_failed = False
+
         for method in methods_needed:
             base_row = {**meta, "exp_idx": exp_idx, "n": n, "method": method, "seed": seed}
             max_n = method_max_n.get(method)
             if max_n is not None and n > max_n:
-                records.append({**base_row, "t_embed": float("nan"),
-                                 "alpha_fit": float("nan"), "status": "skipped_too_large"})
+                records.append({**base_row, "t_embed": float("nan"), "alpha_fit": float("nan"),
+                                 "r0_fit": float("nan"), "r1_fit": float("nan"),
+                                 "status": "skipped_too_large"})
                 continue
 
             try:
                 t0 = time.perf_counter()
                 if method == "s_gd2":
                     X = embed_sgd2(G, random_seed=seed)
-                    alpha_fit = float("nan")
+                    alpha_fit = r0_fit = r1_fit = float("nan")
                 elif method == "TorusMDS":
-                    D, _ = apsp_distance_matrix(G)
+                    if D is None:
+                        D, _ = apsp_distance_matrix(G)
                     X, alpha_fit = embed_torus_mds(
                         D, max_iters=torus_max_iters, seed=seed, stress_mode=torus_stress_mode
                     )
+                    r0_fit = r1_fit = float("nan")
+                elif method in ASPECT_INIT_VARIANTS:
+                    if D is None:
+                        D, _ = apsp_distance_matrix(G)
+                    init_mode, batch_multiplier = ASPECT_INIT_VARIANTS[method]
+                    if init_mode == "smart":
+                        if spectral_result is None and not spectral_failed:
+                            try:
+                                spectral_result = find_fundamental_torus_directions(D / D.max())
+                            except Exception:
+                                spectral_failed = True
+                        if spectral_failed:
+                            raise RuntimeError("spectral init failed for this graph")
+                    X, alpha_fit, r0_fit, r1_fit = embed_torus_mds_aspect(
+                        D, init_mode=init_mode, batch_multiplier=batch_multiplier,
+                        spectral_result=spectral_result, max_iters=torus_max_iters,
+                        seed=seed, stress_mode=torus_stress_mode,
+                    )
                 elif method == "wrap_python":
                     X = embed_wrap_python(G, max_iters=wrap_python_max_iters, seed=seed)
-                    alpha_fit = float("nan")
+                    alpha_fit = r0_fit = r1_fit = float("nan")
                 else:
                     raise ValueError(f"Unknown method {method!r}")
                 t_embed = time.perf_counter() - t0
 
                 np.save(coords_path(output_dir, exp_idx, method), X)
-                records.append({**base_row, "t_embed": round(t_embed, 4),
-                                 "alpha_fit": alpha_fit, "status": "ok"})
+                records.append({**base_row, "t_embed": round(t_embed, 4), "alpha_fit": alpha_fit,
+                                 "r0_fit": r0_fit, "r1_fit": r1_fit, "status": "ok"})
                 done.add((exp_idx, method))
             except Exception:
                 print(f"[{exp_idx}] {method} failed:\n{traceback.format_exc(limit=2)}")
-                records.append({**base_row, "t_embed": float("nan"),
-                                 "alpha_fit": float("nan"), "status": "failed"})
+                records.append({**base_row, "t_embed": float("nan"), "alpha_fit": float("nan"),
+                                 "r0_fit": float("nan"), "r1_fit": float("nan"), "status": "failed"})
 
         since_checkpoint += 1
         if since_checkpoint >= checkpoint_every:

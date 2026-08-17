@@ -125,14 +125,26 @@ useful since it's the slowest method by far and the one most often excluded
 from a quick comparison. For `FAMILY=grg`, `GRAPH_TYPE_WEIGHTS` (default
 `1,1,1`, i.e. euclidean/toroidal/spherical in equal thirds) selects the mix
 of GRG variants generated; `GRAPH_TYPE_WEIGHTS="0,1,0"` generates toroidal
-GRGs only. Example -- TorusMDS vs. s_gd2 only, pure toroidal GRG, n in
-[100, 5000]:
+GRGs only. **Because its value itself contains commas, it can't go inside a
+`--export=ALL,KEY=val,KEY=val` list** -- `sbatch --export` splits on every
+comma in the whole argument, including ones inside a value, since the
+shell's quotes are already gone by the time SLURM parses it (a value like
+`"0,1,0"` silently becomes `GRAPH_TYPE_WEIGHTS=0` plus two bogus `1`/`0`
+entries, and `grg_comparison.py` then rejects it: `--graph-type-weights
+must have exactly 3 comma-separated values`). Export it as a shell variable
+instead and let plain `--export=ALL` forward it:
 
 ```bash
-sbatch --array=0-9 --time=02:00:00 --mem=4G \
-    --export=ALL,FAMILY=grg,N_MIN=100,N_MAX=5000,GRAPHS_PER_SHARD=250,GRAPH_TYPE_WEIGHTS="0,1,0",METHODS="TorusMDS s_gd2" \
+export GRAPH_TYPE_WEIGHTS="0,1,0"
+sbatch --array=0-3 --time=05:00:00 --mem=4G \
+    --export=ALL,FAMILY=grg,N_MIN=100,N_MAX=5000,GRAPHS_PER_SHARD=625,METHODS="TorusMDS s_gd2" \
     verification_experiments/slurm/run_embed_array.sbatch
 ```
+
+(4 shards x 625 graphs = 2500. Fewer, longer-running shards for a small
+cluster with limited concurrent job slots -- scale `GRAPHS_PER_SHARD` and
+`--time` together if you change the shard count, keeping their product at
+the total graphs you want for that family.)
 
 For SuiteSparse (a fixed pre-staged pool, sharded
 by interleaving rather than by size tier since it spans the whole range at
@@ -147,6 +159,77 @@ sbatch --array=0-19 --time=01:00:00 --mem=4G \
 Each array task writes its own `layouts/<family>/.../shard_<i>/` directory
 (graphs + coords + `runs.csv`) and is independently checkpointed/resumable
 -- a killed or requeued task picks up where it left off.
+
+## 1b. Alpha-aspect init comparison (separate experiment)
+
+Compares `learn_mode='alpha_aspect'` TorusMDS (jointly learns scale *and*
+aspect ratio, instead of the fixed unit-square torus of the default
+`learn_mode='alpha'` used above) against `s_gd2`/`wrap_python`, in four
+configurations: {smart spectral init, random init} x {default (4096) batch
+size, 100x (409600) batch size}. These are just four more `method` values
+(`TorusMDS_smart_1x`, `TorusMDS_smart_100x`, `TorusMDS_random_1x`,
+`TorusMDS_random_100x`, defined in `modules/experiment_runner.py`'s
+`ASPECT_INIT_VARIANTS`) -- no new sbatch script needed, `run_embed_array.sbatch`
+already forwards whatever `METHODS` you export. They land in the same
+`layouts/<family>/...` / `runs.csv` / `results/*_comparison.csv` outputs as
+section 1, distinguished only by the `method` column, so the same metrics
+(step 2) and merge (step 3) commands below pick them up unmodified.
+
+Six methods per graph (vs. three above) means roughly double the per-shard
+cost, so this uses smaller, decreasing `GRAPHS_PER_SHARD` per size tier --
+fewer graphs as n grows, since both the baselines (`s_gd2`, `wrap_python`)
+and the new `*_100x` variants get slower at scale. **The `--time` values
+below are rough, padded, unmeasured estimates for the new methods** (unlike
+section 1's, which were calibrated from a real run) -- in particular
+`*_100x` uses a batch 100x the default, and at n=10,000 that's roughly a
+100x larger per-iteration pair-batch than plain `TorusMDS` (which runs in
+under 4s total there), so back-of-envelope that's up to several minutes per
+graph at the top tier. Smoke-test the top tier first
+(`--array=0-0`, `GRAPHS_PER_SHARD=2`), check the real `t_embed` values in
+that shard's `runs.csv`, and size the full submission's `--time` from that --
+exactly as section 1 already recommends for its own tiers.
+
+GRG here is restricted to Euclidean + toroidal only (no spherical):
+`GRAPH_TYPE_WEIGHTS="1,1,0"`. As with section 1's GRG example, export it as a
+shell variable rather than putting it inside `--export=ALL,...` (its commas
+would otherwise be split by `sbatch --export` itself).
+
+```bash
+cd ~/nobackup/torus-mds   # repo root
+mkdir -p slurm_logs
+
+export METHODS="TorusMDS_smart_1x TorusMDS_smart_100x TorusMDS_random_1x TorusMDS_random_100x s_gd2 wrap_python"
+
+# --- GRG (Euclidean + toroidal only) ---
+export GRAPH_TYPE_WEIGHTS="1,1,0"
+sbatch --array=0-2 --time=00:30:00 --mem=2G \
+    --export=ALL,FAMILY=grg,N_MIN=100,N_MAX=1000,GRAPHS_PER_SHARD=150 \
+    verification_experiments/slurm/run_embed_array.sbatch
+sbatch --array=0-2 --time=02:00:00 --mem=4G \
+    --export=ALL,FAMILY=grg,N_MIN=1000,N_MAX=3000,GRAPHS_PER_SHARD=60 \
+    verification_experiments/slurm/run_embed_array.sbatch
+sbatch --array=0-2 --time=05:00:00 --mem=8G \
+    --export=ALL,FAMILY=grg,N_MIN=3000,N_MAX=10000,GRAPHS_PER_SHARD=20 \
+    verification_experiments/slurm/run_embed_array.sbatch
+unset GRAPH_TYPE_WEIGHTS
+
+# --- SBM (same 3 tiers, same decreasing GRAPHS_PER_SHARD) ---
+sbatch --array=0-2 --time=00:30:00 --mem=2G \
+    --export=ALL,FAMILY=sbm,N_MIN=100,N_MAX=1000,GRAPHS_PER_SHARD=150 \
+    verification_experiments/slurm/run_embed_array.sbatch
+sbatch --array=0-2 --time=02:00:00 --mem=4G \
+    --export=ALL,FAMILY=sbm,N_MIN=1000,N_MAX=3000,GRAPHS_PER_SHARD=60 \
+    verification_experiments/slurm/run_embed_array.sbatch
+sbatch --array=0-2 --time=05:00:00 --mem=8G \
+    --export=ALL,FAMILY=sbm,N_MIN=3000,N_MAX=10000,GRAPHS_PER_SHARD=20 \
+    verification_experiments/slurm/run_embed_array.sbatch
+
+# --- SuiteSparse (fixed staged pool, already spans 100-10,000 with
+#     naturally fewer large matrices; sharded by interleaving as usual) ---
+sbatch --array=0-19 --time=02:00:00 --mem=4G \
+    --export=ALL,FAMILY=suitesparse,NUM_SHARDS=20 \
+    verification_experiments/slurm/run_embed_array.sbatch
+```
 
 ## 2. Submit metrics jobs (after the embed jobs finish)
 

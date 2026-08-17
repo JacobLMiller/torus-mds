@@ -650,12 +650,7 @@ def _run_pair_sequence_online_njit(
         pairs_seen += used
 
         if used > 0:
-            if learn_mode == 1:
-                alpha_hat = num / (den + eps)
-                alpha_hat = max(alpha_min, min(alpha_max, alpha_hat))
-                # alpha = (1.0 - alpha_ema) * alpha + alpha_ema * alpha_hat
-                alpha = alpha_hat
-            elif learn_mode == 2:
+            if learn_mode == 2:
                 r = max(geom_min, r0 - geom_lr * (gr0_sum + gr1_sum) / used)
                 r0 = r
                 r1 = r

@@ -21,7 +21,7 @@ import numpy as np
 from scipy.spatial.distance import cdist
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from modules.experiment_runner import METHODS, GraphRecord, run_embeddings
+from modules.experiment_runner import ASPECT_INIT_VARIANTS, METHODS, GraphRecord, run_embeddings
 
 GRAPH_TYPES = ("euclidean", "toroidal", "spherical")
 
@@ -167,8 +167,10 @@ if __name__ == "__main__":
                         help="Comma-separated euclidean,toroidal,spherical sampling weights (default: 1,1,1 = equal thirds)")
     parser.add_argument("--torus-max-iters", type=int, default=2000,
                         help="SGD iterations for TorusMDS (default: 2000)")
-    parser.add_argument("--methods", type=str, nargs="+", default=list(METHODS), choices=list(METHODS),
-                        help=f"Which methods to run, space-separated (default: all of {list(METHODS)})")
+    parser.add_argument("--methods", type=str, nargs="+", default=list(METHODS),
+                        choices=list(METHODS) + list(ASPECT_INIT_VARIANTS),
+                        help=f"Which methods to run, space-separated (default: all of {list(METHODS)}; "
+                             f"also available: {list(ASPECT_INIT_VARIANTS)})")
     parser.add_argument("--wrap-python-max-iters", type=int, default=200,
                         help="Descent iterations for wrap_python -- kept low since its cost is "
                              "O(n^2 * iters); 200 matches the Chen reference's own default (default: 200)")
