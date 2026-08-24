@@ -7,7 +7,7 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import networkx as nx
 import numpy as np
@@ -585,6 +585,23 @@ def _numba_compute_shortest_distance_over_context_fast(
 
 
 @njit(cache=True)
+def _numba_compute_shortest_image_distance(
+    source_x: float,
+    source_y: float,
+    target_x: float,
+    target_y: float,
+    period_x: float,
+    period_y: float,
+) -> tuple[float, float, float]:
+    """Rectangular-torus min-image distance, matching TorusMDS geometry."""
+    dx = source_x - target_x
+    dy = source_y - target_y
+    dx -= math.floor(dx / period_x + 0.5) * period_x
+    dy -= math.floor(dy / period_y + 0.5) * period_y
+    return math.sqrt(dx * dx + dy * dy), dx, dy
+
+
+@njit(cache=True)
 def _numba_run_core(
     seed: int,
     x: np.ndarray,
@@ -604,6 +621,7 @@ def _numba_run_core(
     period_y: float,
     unlimited_base: float,
     unlimited_lambda: float,
+    distance_mode: int,
 ) -> int:
     node_count = x.shape[0]
     visited_stamp = np.zeros(node_count * node_count, dtype=np.int64)
@@ -674,14 +692,24 @@ def _numba_run_core(
                 ya = y[a]
                 xb = x[b]
                 yb = y[b]
-                distance, dx, dy = _numba_compute_shortest_distance_over_context_fast(
-                    xa,
-                    ya,
-                    xb,
-                    yb,
-                    ideal_distance,
-                    period_y,
-                )
+                if distance_mode == 0:
+                    distance, dx, dy = _numba_compute_shortest_distance_over_context_fast(
+                        xa,
+                        ya,
+                        xb,
+                        yb,
+                        ideal_distance,
+                        period_y,
+                    )
+                else:
+                    distance, dx, dy = _numba_compute_shortest_image_distance(
+                        xa,
+                        ya,
+                        xb,
+                        yb,
+                        period_x,
+                        period_y,
+                    )
                 unit_dx = dx / distance
                 unit_dy = dy / distance
                 temp = (distance - ideal_distance) / 2.0
@@ -757,7 +785,7 @@ def _numba_run_core(
     return step
 
 
-def _run_numba(payload: dict[str, Any]) -> dict[str, Any]:
+def _run_numba(payload: dict[str, Any], distance_mode: Literal["ideal_image", "shortest_image"]) -> dict[str, Any]:
     graph = payload["graph"]
     configuration = payload["config"]
     node_count = len(graph["nodes"])
@@ -771,6 +799,7 @@ def _run_numba(payload: dict[str, Any]) -> dict[str, Any]:
     max_steps = int(configuration["maxSteps"])
     number_of_adjustment_iterations = int(configuration["numberOfAdjustmentIterations"])
     delta = float(configuration["delta"])
+    distance_mode_code = 0 if distance_mode == "ideal_image" else 1
 
     if node_count == 0:
         return {
@@ -847,6 +876,7 @@ def _run_numba(payload: dict[str, Any]) -> dict[str, Any]:
         period_y,
         unlimited_base,
         unlimited_lambda,
+        distance_mode_code,
     )
 
     raw_positions = np.empty((node_count, 2), dtype=np.float64)
@@ -878,7 +908,10 @@ def wrap_python(
     delta: float = WEBSITE_DELTA,
     initial_positions: Any = None,
     shortest_path_lengths: np.ndarray | None = None,
+    distance_mode: Literal["ideal_image", "shortest_image"] = "ideal_image",
 ) -> TorusLayoutResult:
+    if distance_mode not in {"ideal_image", "shortest_image"}:
+        raise ValueError("distance_mode must be 'ideal_image' or 'shortest_image'")
     payload, node_labels = build_layout_payload(
         G,
         weight=weight,
@@ -893,7 +926,7 @@ def wrap_python(
         initial_positions=initial_positions,
         shortest_path_lengths=shortest_path_lengths,
     )
-    result = _run_numba(payload)
+    result = _run_numba(payload, distance_mode=distance_mode)
     positions = np.asarray(result["positions"], dtype=float)
     raw_positions = np.asarray(result["rawPositions"], dtype=float)
 
@@ -903,7 +936,7 @@ def wrap_python(
         raw_positions=raw_positions,
         iterations=int(result["iterations"]),
         seed=int(seed),
-        config=dict(result["config"]),
+        config={**result["config"], "distance_mode": distance_mode},
     )
 
 

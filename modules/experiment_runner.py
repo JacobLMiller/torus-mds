@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 import traceback
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
@@ -12,7 +13,7 @@ import pandas as pd
 import s_gd2
 import scipy.sparse as sp
 
-from standalone_toruslayout import wrap_python
+from standalone_toruslayout import wrap_python, wrap_ts
 
 from .graphio import apsp_distance_matrix
 from .initialization import find_fundamental_torus_directions
@@ -28,6 +29,8 @@ DEFAULT_METHOD_MAX_N: dict[str, int | None] = {
     "TorusMDS": None,
     "s_gd2": None,
     "wrap_python": 3500,
+    "wrap_typescript": 1000,
+    "wrap_python_newdist": 3500,
 }
 
 # learn_mode='alpha_aspect' variants: {smart spectral init, random init} x
@@ -42,6 +45,9 @@ ASPECT_INIT_VARIANTS: dict[str, tuple[str, int]] = {
 }
 
 DEFAULT_ASPECT_MAX_N: dict[str, int | None] = {name: None for name in ASPECT_INIT_VARIANTS}
+
+# Standalone layout variants are opt-in, like ASPECT_INIT_VARIANTS
+WRAP_VARIANTS: tuple[str, ...] = ("wrap_typescript", "wrap_python_newdist")
 
 
 @dataclass
@@ -126,6 +132,7 @@ def embed_wrap_python(
     G: nx.Graph,
     max_iters: int = 2000,
     seed: int = 42,
+    distance_mode: str = "ideal_image",
 ) -> np.ndarray:
     """
     Chen "it's-a-wrap" layout via the pure-Python/numba port.
@@ -133,8 +140,21 @@ def embed_wrap_python(
     Deliberately does NOT pass shortest_path_lengths: for unweighted graphs
     (all these are) the runner computes BFS distances internally from the
     edge list, which avoids ever materializing a dense n x n matrix here.
+
+    ``distance_mode='ideal_image'`` preserves the TypeScript algorithm.
+    ``distance_mode='shortest_image'`` uses TorusMDS's rectangular-torus closest-image distance instead.
     """
-    result = wrap_python(G, seed=seed, max_iters=max_iters)
+    result = wrap_python(G, seed=seed, max_iters=max_iters, distance_mode=distance_mode)
+    return result.positions
+
+
+def embed_wrap_typescript(
+    G: nx.Graph,
+    max_iters: int = 2000,
+    seed: int = 42,
+) -> np.ndarray:
+    """Chen "it's-a-wrap" layout through the original TypeScript backend."""
+    result = wrap_ts(G, seed=seed, max_iters=max_iters)
     return result.positions
 
 
@@ -232,6 +252,13 @@ def run_embeddings(
             base_row = {**meta, "exp_idx": exp_idx, "n": n, "method": method, "seed": seed}
             max_n = method_max_n.get(method)
             if max_n is not None and n > max_n:
+                if method == "wrap_typescript":
+                    warnings.warn(
+                        f"Skipping wrap_typescript for n={n}: default limit is {max_n} "
+                        "because the Node implementation may exhaust its 4 GiB heap.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 records.append({**base_row, "t_embed": float("nan"), "alpha_fit": float("nan"),
                                  "r0_fit": float("nan"), "r1_fit": float("nan"),
                                  "status": "skipped_too_large"})
@@ -239,6 +266,12 @@ def run_embeddings(
 
             try:
                 t0 = time.perf_counter()
+                if method == "wrap_typescript" and n >= 600:
+                    warnings.warn(
+                        f"wrap_typescript on n={n} can take minutes and use multiple GiB of RSS.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 if method == "s_gd2":
                     X = embed_sgd2(G, random_seed=seed)
                     alpha_fit = r0_fit = r1_fit = float("nan")
@@ -268,6 +301,12 @@ def run_embeddings(
                     )
                 elif method == "wrap_python":
                     X = embed_wrap_python(G, max_iters=wrap_python_max_iters, seed=seed)
+                    alpha_fit = r0_fit = r1_fit = float("nan")
+                elif method == "wrap_typescript":
+                    X = embed_wrap_typescript(G, max_iters=wrap_python_max_iters, seed=seed)
+                    alpha_fit = r0_fit = r1_fit = float("nan")
+                elif method == "wrap_python_newdist":
+                    X = embed_wrap_python(G, max_iters=wrap_python_max_iters, seed=seed, distance_mode="shortest_image")
                     alpha_fit = r0_fit = r1_fit = float("nan")
                 else:
                     raise ValueError(f"Unknown method {method!r}")
