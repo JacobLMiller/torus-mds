@@ -344,157 +344,6 @@ def _init_parallelogram_yraw(x, y):
 
 
 @numba.njit(cache=True, fastmath=True)
-def _sgd_minibatch_njit_legacy(
-    data,
-    learning_rate,
-    max_iters=500,
-    batch_pairs=4096,
-    seed=0,
-    alpha_init=1.0,
-    eps=1e-12,
-    alpha_min=1e-6,
-    alpha_max=1e6,
-    r0_init=1.0,
-    r1_init=1.0,
-    learn_mode=0,   # 0=fixed,1=alpha,2=square,3=rectangular,4=alpha_aspect,5=rhombic,6=parallelogram
-    geom_lr=0.01,
-    geom_min=1e-6,
-    theta=np.pi / 2,
-    x_init=0.0,
-    y_init=1.0,
-    lr_warmup_init=10.0,
-    lr_warmup_decay=25.0,
-    normalize=False,
-):
-    """
-    Minibatch SGD for torus MDS on a flat parallelogram torus.
-
-    learn_mode=0 ('fixed'):       positions only; geometry fixed.
-    learn_mode=1 ('alpha'):       positions + alpha via per-batch closed-form profiling.
-    learn_mode=2 ('square'):      positions + shared r = r0 = r1 via SGD; alpha fixed.
-    learn_mode=3 ('rectangular'): positions + independent r0, r1 via SGD; alpha fixed.
-    learn_mode=4 ('alpha_aspect'): positions + alpha + log-aspect.
-    learn_mode=5 ('rhombic'):     positions + alpha + rhombus angle (shear x), equal sides.
-    learn_mode=6 ('parallelogram'): positions + alpha + free shear x and height y.
-
-    Modes 5/6 use the (alpha, x, y) parametrization (x_init, y_init); modes 0-4 use
-    (r0_init, r1_init, theta). Returns: (params, alpha, r0, r1, x, y).
-
-    Position step size follows an exponentially-decaying warmup on top of a
-    harmonic tail: step = lr_warmup_init * exp(-it/lr_warmup_decay)
-    + learning_rate/(1+learning_rate*it), floored at 1e-4. learning_rate uses the
-    conventional convention (bigger = bigger steps): it's the tail's initial step
-    size (step_tail(0) == learning_rate), decaying harmonically thereafter -- the
-    equivalent of 1/(c+it) with c = 1/learning_rate. The warmup term vanishes
-    after a few multiples of lr_warmup_decay, leaving the plain harmonic decay of
-    the tail. Set lr_warmup_init=0 to recover the pure-harmonic schedule.
-
-    normalize: False optimizes raw stress sum((alpha*r-d)^2); True optimizes
-    normalized stress sum((alpha*r-d)^2 / d^2), i.e. each pair's term is divided
-    by its own d^2 before summing. rect_grad/parallelogram_grad return the
-    per-pair weight (1, or 1/(d^2+eps)) already folded into their gradients.
-    """
-    n = data.shape[0]
-    np.random.seed(seed)
-
-    params = np.random.rand(n, 2)
-    alpha = alpha_init
-    r0 = r0_init
-    r1 = r1_init
-    x = x_init
-    y = y_init
-    y_raw = _init_parallelogram_yraw(x, y) if learn_mode == 6 else 0.0
-    # Orthogonal closed-form rect path only when theta == pi/2. Equal-side rhombic
-    # (legacy modes 0/1 at theta != 90, seeded x=cos t, y=sin t) and modes 5/6 use
-    # the parallelogram kernel. theta and learn_mode are constant, so decide once.
-    use_rect = learn_mode <= 4 and abs(np.cos(theta)) < 1e-12
-    if learn_mode == 4:
-        aspect_scale = np.sqrt(max(geom_min, r0 * r1))
-        alpha *= aspect_scale
-        log_aspect = np.log(max(geom_min, r1)) - np.log(max(geom_min, r0))
-        if log_aspect < -6.0:
-            log_aspect = -6.0
-        elif log_aspect > 6.0:
-            log_aspect = 6.0
-        r0 = np.exp(-0.5 * log_aspect)
-        r1 = np.exp(0.5 * log_aspect)
-    else:
-        log_aspect = 0.0
-
-    for it in range(max_iters):
-        step_pos = max(
-            lr_warmup_init * np.exp(-it / lr_warmup_decay)
-            + learning_rate / (1.0 + learning_rate * it),
-            1e-4,
-        )
-        if learn_mode == 4:
-            r0 = np.exp(-0.5 * log_aspect)
-            r1 = np.exp(0.5 * log_aspect)
-
-        gr0_sum = 0.0
-        gr1_sum = 0.0
-        gx_sum = 0.0
-        gy_sum = 0.0
-        used = 0
-        drawn = 0
-
-        while drawn < batch_pairs:
-            i = np.random.randint(0, n)
-            j = np.random.randint(0, n)
-            if i == j:
-                continue
-
-            d = data[i, j]
-            if use_rect:
-                g0, g1, dist, gr0_k, gr1_k, w = rect_grad(
-                    params[i], params[j], d, alpha, r0, r1, eps, normalize
-                )
-                gr0_sum += gr0_k
-                gr1_sum += gr1_k
-            else:
-                g0, g1, dist, ga, gb, w = parallelogram_grad(
-                    params[i], params[j], d, alpha, x, y, eps, normalize
-                )
-                gx_sum += ga
-                gy_sum += gb
-
-            params[i, 0] -= step_pos * g0
-            params[i, 1] -= step_pos * g1
-            params[j, 0] += step_pos * g0
-            params[j, 1] += step_pos * g1
-
-            used += 1
-            drawn += 1
-
-        params %= 1.0
-
-        if used > 0:
-            if learn_mode == 2:
-                r = max(geom_min, r0 - geom_lr * (gr0_sum + gr1_sum) / used)
-                r0 = r
-                r1 = r
-            elif learn_mode == 3:
-                r0 = max(geom_min, r0 - geom_lr * gr0_sum / used)
-                r1 = max(geom_min, r1 - geom_lr * gr1_sum / used)
-            elif learn_mode == 4:
-                grad_s = (-0.5 * gr0_sum * r0 + 0.5 * gr1_sum * r1) / used
-                log_aspect -= geom_lr * grad_s
-                if log_aspect < -6.0:
-                    log_aspect = -6.0
-                elif log_aspect > 6.0:
-                    log_aspect = 6.0
-                r0 = np.exp(-0.5 * log_aspect)
-                r1 = np.exp(0.5 * log_aspect)
-            elif learn_mode >= 5:
-                alpha, x, y, y_raw = _update_parallelogram_geom(
-                    params, learn_mode, gx_sum, gy_sum, used,
-                    alpha, x, y, y_raw, geom_lr,
-                )
-
-    return params, alpha, r0, r1, x, y
-
-
-@numba.njit(cache=True, fastmath=True)
 def _run_pair_sequence_online_njit(
     data,
     pair_sequence,
@@ -976,7 +825,6 @@ class MDSTorusProjector(TorusProjector):
             r1_init=1.0,
             learn_mode='alpha',   # 'fixed'|'alpha'|'square'|'rectangular'|'alpha_aspect'|'rhombic'|'parallelogram'
             geom_lr=0.01,
-            sampled_unique=True,
             theta=90.0,           # torus angle in degrees; must be in [60, 120]
             init=None,            # optional (N, 2) initial positions in [0,1)^2 or spectral initialization dict
             learning_rate: float | Literal["auto"] | None = "auto",
@@ -985,10 +833,10 @@ class MDSTorusProjector(TorusProjector):
             # --- position step-size schedule ---
             lr_warmup_init: float | Literal["auto"] | None = "auto",
             lr_warmup_decay: float = 25.0,  # e-folding scale (epochs) of the warmup
-            # --- convergence criteria (sampled_unique path only) ---
+            # --- convergence criteria ---
             tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
             patience: int = 5,    # non-improving chunks before stopping
-            # Cooperative sampled-unique SGD wall-time budget; L-BFGS polishing
+            # Cooperative SGD wall-time budget; L-BFGS polishing
             # is skipped when set because SciPy cannot be stopped safely mid-run.
             time_limit_seconds: Optional[float] = None,
             finalize: Literal[None, "none", "lbfgs"] = None,
@@ -1019,10 +867,10 @@ class MDSTorusProjector(TorusProjector):
                 f"got {coordinate_update!r}"
             )
         if normalized_pair_sampling == "importance" and (
-            stress_mode != "normalized" or coordinate_update != "gradient" or not sampled_unique
+            stress_mode != "normalized" or coordinate_update != "gradient"
         ):
             raise ValueError(
-                "normalized_pair_sampling='importance' requires sampled_unique direct "
+                "normalized_pair_sampling='importance' requires direct "
                 "normalized-gradient optimization"
             )
         if pair_step_cap <= 0.0:
@@ -1031,8 +879,6 @@ class MDSTorusProjector(TorusProjector):
             not np.isfinite(time_limit_seconds) or time_limit_seconds <= 0.0
         ):
             raise ValueError("time_limit_seconds must be a finite positive number or None")
-        if time_limit_seconds is not None and not sampled_unique:
-            raise ValueError("time_limit_seconds requires sampled_unique=True")
         if time_limit_seconds is not None and finalize == "lbfgs":
             warnings.warn(
                 "time_limit_seconds skips L-BFGS polishing because it cannot be "
@@ -1135,25 +981,16 @@ class MDSTorusProjector(TorusProjector):
             lr_warmup_decay=lr_warmup_decay,
             normalize=normalize,
         )
-        if sampled_unique:
-            sgd_fn = sgd_minibatch_njit  # uniform raw / importance-sampled normalized pairs
-            kwargs["tol"] = tol
-            kwargs["patience"] = patience
-            kwargs["time_limit_seconds"] = time_limit_seconds
-            kwargs["run_info"] = run_info
-            kwargs["init"] = init
-            kwargs["bounded"] = coordinate_update == "bounded"
-            kwargs["pair_step_cap"] = pair_step_cap
-            kwargs["normalized_pair_sampling"] = normalized_pair_sampling
-        else:
-            if init is not None:
-                raise ValueError("init is only supported with sampled_unique=True")
-            sgd_fn = _sgd_minibatch_njit_legacy  # sample pairs with replacement; no early stopping
+        kwargs["tol"] = tol
+        kwargs["patience"] = patience
+        kwargs["time_limit_seconds"] = time_limit_seconds
+        kwargs["run_info"] = run_info
+        kwargs["init"] = init
+        kwargs["bounded"] = coordinate_update == "bounded"
+        kwargs["pair_step_cap"] = pair_step_cap
+        kwargs["normalized_pair_sampling"] = normalized_pair_sampling
 
-        coords, alpha, r0, r1, x, y = sgd_fn(**kwargs)
-        if not sampled_unique and mode_int in (1, 4, 5, 6):
-            use_rect = mode_int <= 4 and abs(np.cos(theta_rad)) < 1e-12
-            alpha = _profile_alpha_njit(data, coords, r0, r1, x, y, use_rect, normalize=normalize)
+        coords, alpha, r0, r1, x, y = sgd_minibatch_njit(**kwargs)
 
         self.time_limit_reached_ = bool(run_info.get("time_limit_reached", False))
         self.time_limit_seconds_ = time_limit_seconds
