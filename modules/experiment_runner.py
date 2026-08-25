@@ -34,14 +34,18 @@ DEFAULT_METHOD_MAX_N: dict[str, int | None] = {
 }
 
 # learn_mode='alpha_aspect' variants: {smart spectral init, random init} x
-# {default batch size, 100x batch size}. Kept separate from METHODS (not
-# merged into it) so existing scripts' default `--methods` behavior is
-# unchanged -- these are opt-in via an explicit --methods list.
-ASPECT_INIT_VARIANTS: dict[str, tuple[str, int]] = {
-    "TorusMDS_smart_1x": ("smart", 1),
-    "TorusMDS_smart_100x": ("smart", 100),
-    "TorusMDS_random_1x": ("random", 1),
-    "TorusMDS_random_100x": ("random", 100),
+# {default batch size, 100x batch size}. Random 1x scale variants initialize
+# the points in the centered square [0.5 - 0.5/s, 0.5 + 0.5/s]^2.
+# Kept separate from METHODS so existing scripts' default `--methods` behavior
+# is unchanged -- these are opt-in via an explicit --methods list.
+ASPECT_INIT_VARIANTS: dict[str, tuple[str, int, float]] = {
+    "TorusMDS_smart_1x": ("smart", 1, 1.0),
+    "TorusMDS_smart_100x": ("smart", 100, 1.0),
+    "TorusMDS_random_1x": ("random", 1, 1.0),
+    "TorusMDS_random_100x": ("random", 100, 1.0),
+    "TorusMDS_random_1x_scale2": ("random", 1, 2.0),
+    "TorusMDS_random_1x_scale4": ("random", 1, 4.0),
+    "TorusMDS_random_1x_scale10": ("random", 1, 10.0),
 }
 
 DEFAULT_ASPECT_MAX_N: dict[str, int | None] = {name: None for name in ASPECT_INIT_VARIANTS}
@@ -87,6 +91,7 @@ def embed_torus_mds_aspect(
     D: np.ndarray,
     init_mode: str,
     batch_multiplier: int,
+    init_scale: float = 1.0,
     spectral_result: dict | None = None,
     max_iters: int = 2000,
     seed: int = 42,
@@ -100,7 +105,9 @@ def embed_torus_mds_aspect(
     spectral-dict init check) and uses spectral_result (from
     find_fundamental_torus_directions(D / D.max()), passed in so callers can
     compute/cache it once per graph and share it across batch-size variants).
-    init_mode="random" uses D as-is (matching embed_torus_mds) and init=None.
+    init_mode="random" uses D as-is (matching embed_torus_mds). ``init_scale``
+    contracts its seeded random positions around (0.5, 0.5): scale 2 yields
+    [0.25, 0.75]^2, scale 4 yields [0.375, 0.625]^2, and so on.
 
     learning_rate is left at "auto" so the projector's has-init-dependent
     schedule applies: a smaller tail step with no warmup for the supplied
@@ -109,9 +116,16 @@ def embed_torus_mds_aspect(
     if init_mode == "smart":
         data = D / D.max()
         init = spectral_result
+        schedule_kwargs = {}
     elif init_mode == "random":
         data = D
-        init = None
+        if init_scale < 1.0:
+            raise ValueError(f"init_scale must be at least 1, got {init_scale}")
+        init = 0.5 + (np.random.RandomState(seed).rand(len(D), 2) - 0.5) / init_scale
+        # Supplying the scaled array would otherwise make the projector treat
+        # it like a structured/spectral init. Preserve the normal random-start
+        # schedule so scale is the only experimental difference.
+        schedule_kwargs = {"learning_rate": 1.0, "lr_warmup_init": 10.0}
     else:
         raise ValueError(f"Unknown init_mode {init_mode!r}")
 
@@ -124,6 +138,7 @@ def embed_torus_mds_aspect(
         learn_mode=LearnMode.ALPHA_ASPECT,
         batch_size=4096 * batch_multiplier,
         init=init,
+        **schedule_kwargs,
     )
     return X, float(proj.alpha_), float(proj.r0_), float(proj.r1_)
 
@@ -285,7 +300,7 @@ def run_embeddings(
                 elif method in ASPECT_INIT_VARIANTS:
                     if D is None:
                         D, _ = apsp_distance_matrix(G)
-                    init_mode, batch_multiplier = ASPECT_INIT_VARIANTS[method]
+                    init_mode, batch_multiplier, init_scale = ASPECT_INIT_VARIANTS[method]
                     if init_mode == "smart":
                         if spectral_result is None and not spectral_failed:
                             try:
@@ -295,7 +310,7 @@ def run_embeddings(
                         if spectral_failed:
                             raise RuntimeError("spectral init failed for this graph")
                     X, alpha_fit, r0_fit, r1_fit = embed_torus_mds_aspect(
-                        D, init_mode=init_mode, batch_multiplier=batch_multiplier,
+                        D, init_mode=init_mode, batch_multiplier=batch_multiplier, init_scale=init_scale,
                         spectral_result=spectral_result, max_iters=torus_max_iters,
                         seed=seed, stress_mode=torus_stress_mode,
                     )
