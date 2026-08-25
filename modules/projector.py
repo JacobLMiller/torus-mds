@@ -10,6 +10,7 @@ Try three different sizes
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Optional, Literal, Tuple
 import time
 import warnings
@@ -32,6 +33,19 @@ from .geometry import (
 )
 
 DEFAULT_SEQUENCE_CHUNK_EPOCHS = 128
+
+
+class LearnMode(IntEnum):
+    """Public optimization modes for :class:`MDSTorusProjector`."""
+
+    FIXED = 0
+    ALPHA = 1
+    ALPHA_ASPECT = 4
+    RHOMBIC = 5
+    PARALLELOGRAM = 6
+
+
+_NUMBA_LEARN_MODE_CODES = frozenset(int(mode) for mode in LearnMode)
 
 
 def _check_distance_matrix(D: np.ndarray) -> np.ndarray:
@@ -80,7 +94,7 @@ def _lbfgs_polish_options(finalize_iters: int, finalize_options: Optional[dict])
 
 
 def _polish_shape_kwargs(mode_int: int, r0: float, r1: float, x: float, y: float, theta: float) -> dict:
-    if mode_int in (3, 4):
+    if mode_int == LearnMode.ALPHA_ASPECT:
         return {
             "shape_mode": "rectangular",
             "s0": float(np.log(max(r0, 1e-300) / max(r1, 1e-300))),
@@ -356,7 +370,7 @@ def _run_pair_sequence_online_njit(
     alpha_max=1e6,
     r0_init=1.0,
     r1_init=1.0,
-    learn_mode=0,   # 0=fixed,1=alpha,2=square,3=rectangular,4=alpha_aspect,5=rhombic,6=parallelogram
+    learn_mode=0,   # LearnMode value: fixed, alpha, alpha_aspect, rhombic, or parallelogram.
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
@@ -381,7 +395,7 @@ def _run_pair_sequence_online_njit(
     # Orthogonal closed-form rect path only when theta == pi/2. Equal-side rhombic
     # (legacy modes 0/1 at theta != 90, seeded x=cos t, y=sin t) and modes 5/6 use
     # the parallelogram kernel. theta and learn_mode are constant, so decide once.
-    use_rect = learn_mode <= 4 and abs(np.cos(theta)) < 1e-12
+    use_rect = (learn_mode == 0 or learn_mode == 1 or learn_mode == 4) and abs(np.cos(theta)) < 1e-12
     if learn_mode == 4:
         aspect_scale = np.sqrt(max(geom_min, r0 * r1))
         alpha *= aspect_scale
@@ -499,14 +513,7 @@ def _run_pair_sequence_online_njit(
         pairs_seen += used
 
         if used > 0:
-            if learn_mode == 2:
-                r = max(geom_min, r0 - geom_lr * (gr0_sum + gr1_sum) / used)
-                r0 = r
-                r1 = r
-            elif learn_mode == 3:
-                r0 = max(geom_min, r0 - geom_lr * gr0_sum / used)
-                r1 = max(geom_min, r1 - geom_lr * gr1_sum / used)
-            elif learn_mode == 4:
+            if learn_mode == 4:
                 grad_s = (-0.5 * gr0_sum * r0 + 0.5 * gr1_sum * r1) / used
                 log_aspect -= geom_lr * grad_s
                 if log_aspect < -6.0:
@@ -515,7 +522,7 @@ def _run_pair_sequence_online_njit(
                     log_aspect = 6.0
                 r0 = np.exp(-0.5 * log_aspect)
                 r1 = np.exp(0.5 * log_aspect)
-            elif learn_mode >= 5:
+            elif learn_mode == 5 or learn_mode == 6:
                 alpha, x, y, y_raw = _update_parallelogram_geom(
                     params, learn_mode, gx_sum, gy_sum, used,
                     alpha, x, y, y_raw, geom_lr,
@@ -543,7 +550,7 @@ def sgd_minibatch_njit(
     alpha_max=1e6,
     r0_init=1.0,
     r1_init=1.0,
-    learn_mode=0,   # 0=fixed,1=alpha,2=square,3=rectangular,4=alpha_aspect,5=rhombic,6=parallelogram
+    learn_mode=0,   # LearnMode value: fixed, alpha, alpha_aspect, rhombic, or parallelogram.
     geom_lr=0.01,
     geom_min=1e-6,
     theta=np.pi / 2,
@@ -613,7 +620,10 @@ def sgd_minibatch_njit(
 
     rng = np.random.default_rng(seed)
     pairs = _all_unique_pairs(n)
-    use_rect = learn_mode <= 4 and abs(np.cos(theta)) < 1e-12
+    if learn_mode not in _NUMBA_LEARN_MODE_CODES:
+        raise ValueError(f"Unknown learn_mode code {learn_mode!r}.")
+    learn_mode = int(learn_mode)
+    use_rect = (learn_mode == 0 or learn_mode == 1 or learn_mode == 4) and abs(np.cos(theta)) < 1e-12
     # Importance sampling is calibrated for the direct metric-gradient path
     weighted_sampling = normalize and not bounded and normalized_pair_sampling == "importance"
     sampling_gamma = 0.0
@@ -823,7 +833,7 @@ class MDSTorusProjector(TorusProjector):
             alpha_init=1.0,
             r0_init=1.0,
             r1_init=1.0,
-            learn_mode='alpha',   # 'fixed'|'alpha'|'square'|'rectangular'|'alpha_aspect'|'rhombic'|'parallelogram'
+            learn_mode: LearnMode = LearnMode.ALPHA,
             geom_lr=0.01,
             theta=90.0,           # torus angle in degrees; must be in [60, 120]
             init=None,            # optional (N, 2) initial positions in [0,1)^2 or spectral initialization dict
@@ -888,22 +898,20 @@ class MDSTorusProjector(TorusProjector):
             )
         normalize = stress_mode == "normalized"
         has_init = init is not None
-        mode_int = {
-            'fixed': 0, 'alpha': 1, 'square': 2, 'rectangular': 3,
-            'alpha_aspect': 4, 'rhombic': 5, 'parallelogram': 6,
-        }[learn_mode]
+        if not isinstance(learn_mode, LearnMode):
+            raise TypeError(f"learn_mode must be a LearnMode, got {learn_mode!r}")
+        mode_int = learn_mode.value
 
-        # Modes 0-4 use the rect kernel, exact only for rectangular or equal-side
-        # rhombic bases. At theta != 90, 'fixed' and 'alpha' are fine as a fixed-angle
-        # rhombic torus (equal sides required); 'square'/'rectangular'/'alpha_aspect'
-        # contradict a non-rectangular rhombus and are redirected to the dedicated
-        # parallelogram modes (5, 6).
+        # Fixed, alpha, and alpha-aspect modes use the rectangular kernel. At theta !=
+        # 90, fixed and alpha remain valid equal-side rhombi, while alpha-aspect must
+        # use one of the dedicated parallelogram modes.
         if theta != 90.0:
-            if mode_int in (2, 3, 4):
+            if mode_int == LearnMode.ALPHA_ASPECT:
                 raise ValueError(
                     f"learn_mode={learn_mode!r} does not support theta != 90 "
-                    "(non-rectangular). use learn_mode='rhombic' to learn the angle, "
-                    "'parallelogram' for a general shape, or 'alpha'/'fixed' with "
+                    "(non-rectangular). use LearnMode.RHOMBIC to learn the angle, "
+                    "LearnMode.PARALLELOGRAM for a general shape, or LearnMode.ALPHA/"
+                    "LearnMode.FIXED with "
                     "r0_init == r1_init for a fixed-angle rhombic torus."
                 )
             if mode_int in (0, 1) and not np.isclose(r0_init, r1_init):
@@ -946,7 +954,7 @@ class MDSTorusProjector(TorusProjector):
         # runs on the parallelogram kernel (rect_grad is orthogonal only). The (x, y)
         # unit-circle basis carries no side length, so the fixed side length r0_init is
         # folded into the parallelogram scale here and unfolded out of alpha_ on report.
-        non_orth_rect = mode_int in (0, 1) and theta != 90.0
+        non_orth_rect = mode_int in (LearnMode.FIXED, LearnMode.ALPHA) and theta != 90.0
 
         # Initial shear/height for the parallelogram modes (5, 6) and the legacy rhombic
         # path. lengths_angle_to_xy returns the unit-circle (cos t, sin t) for equal sides.
@@ -954,10 +962,10 @@ class MDSTorusProjector(TorusProjector):
             _, x0, y0 = lengths_angle_to_xy(r0_init, r1_init, theta_rad)
         else:
             x0, y0 = float(x_init), float(y_init)
-        if mode_int == 5:
+        if mode_int == LearnMode.RHOMBIC:
             # rhombic: start on the unit circle (equal sides) at the given angle
             x0, y0 = float(np.cos(theta_rad)), float(np.sin(theta_rad))
-        if mode_int == 6 and x_init is None and abs(x0) < 1e-6:
+        if mode_int == LearnMode.PARALLELOGRAM and x_init is None and abs(x0) < 1e-6:
             x0 = 0.05  # asymmetric init to escape the x -> -x (rectangular) saddle
 
         alpha_kernel = alpha_init * r0_init if non_orth_rect else alpha_init
@@ -1039,7 +1047,7 @@ class MDSTorusProjector(TorusProjector):
         else:
             raise ValueError("finalize must be None, 'none', or 'lbfgs'")
 
-        if mode_int >= 5:
+        if mode_int in (LearnMode.RHOMBIC, LearnMode.PARALLELOGRAM):
             # Report learned (alpha, x, y) as side lengths + angle; the b0 length
             # lives in alpha_, so r0_ = 1 and r1_ = |b1| / |b0|.
             self.alpha_ = float(alpha)

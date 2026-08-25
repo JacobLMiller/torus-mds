@@ -17,7 +17,7 @@ from standalone_toruslayout import wrap_python, wrap_ts
 
 from .graphio import apsp_distance_matrix
 from .initialization import find_fundamental_torus_directions
-from .projector import MDSTorusProjector
+from .projector import LearnMode, MDSTorusProjector
 
 # ---------------------------------------------------------------------------
 # Method registry
@@ -121,7 +121,7 @@ def embed_torus_mds_aspect(
         max_iters=max_iters,
         seed=seed,
         stress_mode=stress_mode,
-        learn_mode="alpha_aspect",
+        learn_mode=LearnMode.ALPHA_ASPECT,
         batch_size=4096 * batch_multiplier,
         init=init,
     )
