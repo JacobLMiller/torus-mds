@@ -81,10 +81,10 @@ def embed_torus_mds(
     max_iters: int = 2000,
     seed: int = 42,
     stress_mode: str = "raw",
-) -> tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float, int | None, str | None]:
     proj = MDSTorusProjector(projection="wrap")
     X = proj.fit_transform(D, max_iters=max_iters, seed=seed, stress_mode=stress_mode)
-    return X, float(proj.alpha_)
+    return X, float(proj.alpha_), proj.n_iter_, proj.termination_reason_
 
 
 def embed_torus_mds_aspect(
@@ -96,7 +96,7 @@ def embed_torus_mds_aspect(
     max_iters: int = 2000,
     seed: int = 42,
     stress_mode: str = "raw",
-) -> tuple[np.ndarray, float, float, float]:
+) -> tuple[np.ndarray, float, float, float, int | None, str | None]:
     """
     learn_mode='alpha_aspect' TorusMDS: jointly learns alpha and the aspect
     ratio (r0, r1), instead of the fixed unit-square torus of embed_torus_mds.
@@ -140,7 +140,10 @@ def embed_torus_mds_aspect(
         init=init,
         **schedule_kwargs,
     )
-    return X, float(proj.alpha_), float(proj.r0_), float(proj.r1_)
+    return (
+        X, float(proj.alpha_), float(proj.r0_), float(proj.r1_),
+        proj.n_iter_, proj.termination_reason_,
+    )
 
 
 def embed_wrap_python(
@@ -276,11 +279,14 @@ def run_embeddings(
                     )
                 records.append({**base_row, "t_embed": float("nan"), "alpha_fit": float("nan"),
                                  "r0_fit": float("nan"), "r1_fit": float("nan"),
+                                 "n_iter": float("nan"), "termination_reason": None,
                                  "status": "skipped_too_large"})
                 continue
 
             try:
                 t0 = time.perf_counter()
+                n_iter = float("nan")
+                termination_reason = None
                 if method == "wrap_typescript" and n >= 600:
                     warnings.warn(
                         f"wrap_typescript on n={n} can take minutes and use multiple GiB of RSS.",
@@ -293,8 +299,8 @@ def run_embeddings(
                 elif method == "TorusMDS":
                     if D is None:
                         D, _ = apsp_distance_matrix(G)
-                    X, alpha_fit = embed_torus_mds(
-                        D, max_iters=torus_max_iters, seed=seed, stress_mode=torus_stress_mode
+                    X, alpha_fit, n_iter, termination_reason = embed_torus_mds(
+                        D, max_iters=torus_max_iters, seed=seed, stress_mode=torus_stress_mode,
                     )
                     r0_fit = r1_fit = float("nan")
                 elif method in ASPECT_INIT_VARIANTS:
@@ -309,7 +315,7 @@ def run_embeddings(
                                 spectral_failed = True
                         if spectral_failed:
                             raise RuntimeError("spectral init failed for this graph")
-                    X, alpha_fit, r0_fit, r1_fit = embed_torus_mds_aspect(
+                    X, alpha_fit, r0_fit, r1_fit, n_iter, termination_reason = embed_torus_mds_aspect(
                         D, init_mode=init_mode, batch_multiplier=batch_multiplier, init_scale=init_scale,
                         spectral_result=spectral_result, max_iters=torus_max_iters,
                         seed=seed, stress_mode=torus_stress_mode,
@@ -329,12 +335,15 @@ def run_embeddings(
 
                 np.save(coords_path(output_dir, exp_idx, method), X)
                 records.append({**base_row, "t_embed": round(t_embed, 4), "alpha_fit": alpha_fit,
-                                 "r0_fit": r0_fit, "r1_fit": r1_fit, "status": "ok"})
+                                 "r0_fit": r0_fit, "r1_fit": r1_fit, "n_iter": n_iter,
+                                 "termination_reason": termination_reason, "status": "ok"})
                 done.add((exp_idx, method))
             except Exception:
                 print(f"[{exp_idx}] {method} failed:\n{traceback.format_exc(limit=2)}")
                 records.append({**base_row, "t_embed": float("nan"), "alpha_fit": float("nan"),
-                                 "r0_fit": float("nan"), "r1_fit": float("nan"), "status": "failed"})
+                                 "r0_fit": float("nan"), "r1_fit": float("nan"),
+                                 "n_iter": float("nan"), "termination_reason": None,
+                                 "status": "failed"})
 
         since_checkpoint += 1
         if since_checkpoint >= checkpoint_every:
