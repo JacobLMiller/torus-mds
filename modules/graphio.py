@@ -6,11 +6,20 @@ from pathlib import Path
 
 import numpy as np
 import networkx as nx
+from scipy.sparse.csgraph import dijkstra
 
 
-def apsp_distance_matrix(G: nx.Graph, weight: str = "weight") -> tuple[np.ndarray, list]:
+def apsp_distance_matrix(G: nx.Graph, weight: str = "weight",
+                         method: str = "scipy") -> tuple[np.ndarray, list]:
     """
     All-pairs shortest path distance matrix for graph G.
+
+    method : "scipy" (default) runs scipy.sparse.csgraph.dijkstra (C speed);
+             "networkx" runs networkx's pure-python all_pairs_dijkstra (~100-1000x
+             slower per edge relaxation, kept as a fallback).
+
+    Note: the scipy branch returns np.inf for unreachable pairs (disconnected graph),
+    whereas the networkx branch leaves such entries at 0.0.
 
     Returns
     -------
@@ -18,14 +27,24 @@ def apsp_distance_matrix(G: nx.Graph, weight: str = "weight") -> tuple[np.ndarra
     nodes : list of nodes in row/column order
     """
     nodes = list(G.nodes())
-    idx = {n: k for k, n in enumerate(nodes)}
-    n = len(nodes)
-    D = np.zeros((n, n), dtype=np.float64)
-    for src, dist_dict in nx.all_pairs_dijkstra_path_length(G, weight=weight):
-        i = idx[src]
-        for dst, d in dist_dict.items():
-            D[i, idx[dst]] = float(d)
-    return D, nodes
+
+    if method == "scipy":
+        # nodelist fixes row/col order to `nodes`, matching the networkx branch.
+        A = nx.to_scipy_sparse_array(G, nodelist=nodes, weight=weight)
+        D = dijkstra(A, directed=False)
+        return D, nodes
+
+    if method == "networkx":
+        idx = {n: k for k, n in enumerate(nodes)}
+        n = len(nodes)
+        D = np.zeros((n, n), dtype=np.float64)
+        for src, dist_dict in nx.all_pairs_dijkstra_path_length(G, weight=weight):
+            i = idx[src]
+            for dst, d in dist_dict.items():
+                D[i, idx[dst]] = float(d)
+        return D, nodes
+
+    raise ValueError(f"method must be 'scipy' or 'networkx', got {method!r}")
 
 
 def periodic_lattice_graph(nx_size: int, ny_size: int, diagonal: bool = False) -> nx.Graph:
