@@ -469,12 +469,17 @@ def find_fundamental_torus_directions(
 
 
 def _torus_geom_from_result(result):
-    """Build a minimal torus geometry object for plot_embedding_with_torus_edges."""
-    d = result["fundamental_directions"]
+    """Build a minimal torus geometry object for plot_embedding_with_torus_edges.
+
+    r0, r1 come from rect_torus_init_from_spectral, so they carry the spectral aspect
+    ratio scaled to a torus diameter of 1 (matching distances normalized to max 1),
+    not the raw side lengths, whose absolute scale is bandwidth dependent and unitless.
+    """
+    coords, r0, r1 = rect_torus_init_from_spectral(result)
     return types.SimpleNamespace(
-        torus_embedding_=torus_init_from_eigenpairs(d[0]["eigenvectors"], d[1]["eigenvectors"]),
+        torus_embedding_=coords,
         alpha_=1.0,
-        r0_=d[0]["side_length"],
-        r1_=d[1]["side_length"],
+        r0_=r0,
+        r1_=r1,
         theta_=np.pi / 2,
     )

@@ -15,7 +15,9 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
                                    edge_alpha=0.10, edge_lw=0.4,
                                    colors=None, cmap=None, vmin=None, vmax=None,
                                    torus=None,
-                                   ax=None):
+                                   ax=None,
+                                   n_ticks=3, tick_fontsize=6, show_tick_labels=True,
+                                   rasterized=False):
     """
     Scatter + edges drawn along shortest torus geodesics, displayed in physical space.
 
@@ -29,6 +31,16 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
       e2 = (alpha*r1*cos(theta), alpha*r1*sin(theta))
     All coordinates are mapped through M before plotting. Normal axes are hidden;
     tick marks with physical-unit labels are drawn directly on the parallelogram edges.
+
+    n_ticks / tick_fontsize / show_tick_labels control those edge ticks. Small panels
+    need few, small labels: 5 labels at fontsize 8 collide below roughly 1.5 inches
+    of panel width. show_tick_labels=False keeps the tick marks but drops the numbers.
+
+    rasterized=True draws only the two heavy artists (the edge LineCollection and the
+    scatter) into a raster layer, keeping the domain boundary, ticks and labels as
+    vectors. Use it for pdf/svg output of large graphs, where tens of thousands of
+    vector segments make the file slow to open. Their resolution is then set by the
+    savefig dpi, so save with a print dpi (e.g. fig.savefig(..., dpi=600)).
     """
     # Resolve embedding
     if X is None:
@@ -50,7 +62,8 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
     M = np.array([[r0, r1 * np.cos(theta)],
                   [0,  r1 * np.sin(theta)]])
 
-    if ax is None:
+    own_fig = ax is None
+    if own_fig:
         fig, ax = plt.subplots()
 
     # edges — geodesic segments in [0,1)^2, split at torus-boundary crossings, mapped to
@@ -86,25 +99,27 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
             segs.append(np.stack([a, b], axis=1))
         if segs:
             ax.add_collection(LineCollection(np.concatenate(segs, axis=0), colors="k",
-                                             alpha=edge_alpha, linewidths=edge_lw, zorder=1))
+                                             alpha=edge_alpha, linewidths=edge_lw, zorder=1,
+                                             rasterized=rasterized))
 
     # points. Pass scalar `colors` with a `cmap` (not pre-mapped RGBA) so the
     # returned PathCollection is a proper ScalarMappable and plt.colorbar works.
     X_phys = X @ M.T
     ax.scatter(X_phys[:, 0], X_phys[:, 1], s=s, alpha=node_alpha, zorder=2,
                c=colors if colors is not None else "blue",
-               cmap=cmap, vmin=vmin, vmax=vmax)
+               cmap=cmap, vmin=vmin, vmax=vmax, rasterized=rasterized)
 
     # parallelogram boundary of the fundamental domain
     corners = np.array([[0, 0], [1, 0], [1, 1], [0, 1]]) @ M.T
     ax.add_patch(MplPolygon(corners, closed=True, fill=False,
                             edgecolor='gray', lw=1, zorder=3))
 
-    ax.set_aspect('equal', adjustable='datalim')
+    # 'box' (not 'datalim') so the axes box shrinks to the aspect of the torus instead
+    # of inflating the data range, which would pad the panel with whitespace.
+    ax.set_aspect('equal', adjustable='box')
     ax.axis('off')
 
     # --- Tick marks with physical-unit labels on parallelogram edges ---
-    n_ticks   = 5
     tick_ts   = np.linspace(0, 1, n_ticks)
     tick_size = 0.025 * max(r0, r1)   # tick length in physical units
     pad       = 0.03  * max(r0, r1)   # gap between tick tip and label
@@ -113,28 +128,42 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
     e2_end  = M @ np.array([0.0, 1.0])                   # physical tip of e2
     e2_perp = np.array([-np.sin(theta), np.cos(theta)])  # outward normal to left side
 
-    # Bottom side (e1): 5 ticks with labels showing physical distance from 0 to r0
+    # Bottom side (e1): ticks with labels showing physical distance from 0 to r0
     for t in tick_ts:
         pt = np.array([t * r0, 0.0])
         tip = pt + tick_size * e1_perp
         ax.plot([pt[0], tip[0]], [pt[1], tip[1]], color='dimgray', lw=0.8, zorder=4)
-        lbl_pos = tip + pad * e1_perp
-        ax.text(lbl_pos[0], lbl_pos[1], f"{t * r0:.3g}",
-                ha='center', va='top', fontsize=8, color='dimgray')
+        if show_tick_labels:
+            lbl_pos = tip + pad * e1_perp
+            ax.text(lbl_pos[0], lbl_pos[1], f"{t * r0:.3g}",
+                    ha='center', va='top', fontsize=tick_fontsize, color='dimgray')
 
-    # Left side (e2): 5 ticks with labels showing physical distance from 0 to r1.
+    # Left side (e2): same ticks, labels showing physical distance from 0 to r1.
     # Skip the t=0 label — already covered by the "0" on the bottom side.
     for t in tick_ts:
         pt = t * e2_end
         tip = pt + tick_size * e2_perp
         ax.plot([pt[0], tip[0]], [pt[1], tip[1]], color='dimgray', lw=0.8, zorder=4)
-        if t > 0:
+        if show_tick_labels and t > 0:
             lbl_pos = tip + pad * e2_perp
             ax.text(lbl_pos[0], lbl_pos[1], f"{t * r1:.3g}",
                     ha='center', va='center', rotation=np.degrees(theta),
-                    fontsize=8, color='dimgray')
+                    fontsize=tick_fontsize, color='dimgray')
 
-    plt.tight_layout()
+    # Explicit limits: the tick labels are drawn with ax.text and do not enter the
+    # data limits, so autoscaling would clip them. Extra room on the bottom/left,
+    # where the labels sit.
+    lo, hi = corners.min(axis=0), corners.max(axis=0)
+    m = tick_size + pad
+    label_room = 2.5 * m if show_tick_labels else 0.0
+    ax.set_xlim(lo[0] - m - label_room, hi[0] + m)
+    ax.set_ylim(lo[1] - m - label_room, hi[1] + m)
+
+    # only lay out the figure when this call owns it; calling tight_layout on a
+    # caller-supplied figure overrides its layout engine (e.g. constrained_layout)
+    # and blows the spacing between panels apart.
+    if own_fig:
+        fig.tight_layout()
     return ax
 
 
