@@ -4,19 +4,103 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.collections import LineCollection
 
 
-from .geometry import torus_edge_segments
+from .geometry import torus_edge_segments, min_image_delta
 from .metrics import geodesic_matrix, subsample
 
 
+def _edge_index_pairs(G):
+    """(E, 2) array of row indices, one row per edge of G, in G.nodes() order."""
+    idx = {n: i for i, n in enumerate(G.nodes())}
+    return np.array([(idx[u], idx[v]) for u, v in G.edges()], dtype=np.int64)
+
+
+def _torus_edge_segments_batch(p, d, M):
+    """
+    (S, 2, 2) physical segments for the straight geodesics p -> p + d, split where they
+    leave the fundamental domain, each piece shifted back into [0,1]^2 and mapped through M.
+
+    The batched counterpart of geometry.torus_edge_segments. A minimal-image displacement
+    has |d| <= 1 per axis, so a geodesic crosses each axis at most once and breaks into at
+    most three pieces — which is what makes the fixed three-slice loop below enough.
+    """
+    E = len(p)
+    r = p + d
+    cross = np.zeros((E, 2))          # crossing parameter per axis, 0 where there is none
+    for k in (0, 1):
+        up = (d[:, k] > 0) & (r[:, k] > 1.0)
+        dn = (d[:, k] < 0) & (r[:, k] < 0.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cross[up, k] = np.clip(((1.0 - p[:, k]) / d[:, k])[up], 0.0, 1.0)
+            cross[dn, k] = np.clip(((0.0 - p[:, k]) / d[:, k])[dn], 0.0, 1.0)
+    cross.sort(axis=1)                # the no-crossing zeros sort to the front
+    bp = np.concatenate([np.zeros((E, 1)), cross, np.ones((E, 1))], axis=1)
+
+    segs = []
+    for i0, i1 in ((0, 1), (1, 2), (2, 3)):
+        t0, t1 = bp[:, i0], bp[:, i1]
+        keep = (t1 - t0) > 1e-9       # drop the degenerate pieces of uncrossed edges
+        if not keep.any():
+            continue
+        a = p[keep] + t0[keep, None] * d[keep]
+        b = p[keep] + t1[keep, None] * d[keep]
+        tile = np.floor(0.5 * (a + b))
+        a = np.clip(a - tile, 0.0, 1.0) @ M.T
+        b = np.clip(b - tile, 0.0, 1.0) @ M.T
+        segs.append(np.stack([a, b], axis=1))
+    return np.concatenate(segs, axis=0) if segs else np.empty((0, 2, 2))
+
+
+# Edge-tick geometry, shared by plot_embedding_with_torus_edges and torus_panel_aspect
+# so the two cannot drift apart. Fractions of the longer physical side.
+_TICK_FRAC = 0.025    # tick length
+_PAD_FRAC = 0.030     # gap between tick tip and its label
+_LABEL_ROOM = 2.5     # label height, in units of (tick + pad)
+
+
+def _panel_margins(r0, r1, show_tick_labels=True):
+    """(tick margin, extra label margin) around the fundamental domain, in physical units."""
+    m = (_TICK_FRAC + _PAD_FRAC) * max(r0, r1)
+    return m, (_LABEL_ROOM * m if show_tick_labels else 0.0)
+
+
+def _physical_lattice(torus):
+    """(r0, r1, theta) in physical units: the alpha-scaled side lengths and the angle."""
+    alpha = torus.alpha_ if (torus is not None and torus.alpha_ is not None) else 1.0
+    r0 = alpha * (torus.r0_ if (torus is not None and torus.r0_ is not None) else 1.0)
+    r1 = alpha * (torus.r1_ if (torus is not None and torus.r1_ is not None) else 1.0)
+    theta = torus.theta_ if (torus is not None and getattr(torus, 'theta_', None) is not None) else np.pi / 2
+    return r0, r1, theta
+
+
+def torus_panel_aspect(torus, show_tick_labels=True):
+    """
+    width / height of the axes box plot_embedding_with_torus_edges draws for `torus`.
+
+    Use it for width_ratios in a multi-panel figure: the panels use equal aspect with
+    adjustable='box', so a cell whose shape does not match gets letterboxed, i.e. padded
+    with whitespace. This is not simply r0 / r1 — the parallelogram's bounding box is
+    wider than r0 once it is sheared, and the margins holding the edge ticks and their
+    labels are equal on both axes, which pulls the ratio towards 1.
+    """
+    r0, r1, theta = _physical_lattice(torus)
+    m, label_room = _panel_margins(r0, r1, show_tick_labels)
+    width = r0 + abs(r1 * np.cos(theta))
+    height = r1 * np.sin(theta)
+    return (width + 2 * m + label_room) / (height + 2 * m + label_room)
+
+
 def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
-                                   s=10, node_alpha=0.9,
+                                   s=10, node_alpha=0.9, node_lw=None,
                                    edge_alpha=0.10, edge_lw=0.4,
-                                   colors=None,
+                                   colors=None, cmap=None, vmin=None, vmax=None,
                                    order=None,
                                    torus=None,
-                                   ax=None):
+                                   ax=None,
+                                   n_ticks=5, tick_fontsize=8, show_tick_labels=True,
+                                   rasterized=False):
     """
     Scatter + edges drawn along shortest torus geodesics, displayed in physical space.
 
@@ -30,6 +114,26 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
       e2 = (alpha*r1*cos(theta), alpha*r1*sin(theta))
     All coordinates are mapped through M before plotting. Normal axes are hidden;
     tick marks with physical-unit labels are drawn directly on the parallelogram edges.
+
+    node_lw is the scatter marker edge width, None meaning the rcParam default. That
+    default (lines.linewidth) is a large fraction of a marker once s drops below a few
+    points squared, so pass node_lw=0 for dense point clouds in small panels.
+
+    colors / cmap / vmin / vmax go straight to ax.scatter. Pass scalar `colors` together
+    with a `cmap` (rather than pre-mapped RGBA) so the scatter stays a ScalarMappable and
+    a shared colorbar can be built from it. vmin/vmax pin the range across panels.
+
+    n_ticks / tick_fontsize / show_tick_labels control the edge ticks. Small panels need
+    few, small labels: 5 labels at fontsize 8 collide below roughly 1.5 inches of panel
+    width. show_tick_labels=False keeps the tick marks but drops the numbers.
+
+    rasterized=True draws only the heavy artists (edges and scatter) into a raster layer,
+    leaving the domain boundary, ticks and labels as vectors. Use it for pdf/svg output of
+    large point clouds. Their resolution then comes from the savefig dpi, so save with a
+    print dpi, e.g. fig.savefig(..., dpi=400).
+
+    Use torus_panel_aspect(torus) for the width_ratios of a figure holding several of
+    these panels side by side.
     """
     # Resolve embedding
     if X is None:
@@ -37,19 +141,10 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
             raise ValueError("Provide either X or a fitted torus object with torus_embedding_.")
         X = torus.torus_embedding_
 
-    if order is not None:
-        X = X[order]
-        if colors is not None:
-            colors = colors[order]
-
     X = np.asarray(X, dtype=np.float64) % 1.0
-    idx = {n: i for i, n in enumerate(G.nodes())} if G is not None else {}
 
     # Physical side lengths: alpha * r; fall back to 1 if not available
-    alpha = torus.alpha_ if (torus is not None and torus.alpha_ is not None) else 1.0
-    r0 = alpha * (torus.r0_ if (torus is not None and torus.r0_ is not None) else 1.0)
-    r1 = alpha * (torus.r1_ if (torus is not None and torus.r1_ is not None) else 1.0)
-    theta = torus.theta_ if (torus is not None and hasattr(torus, 'theta_') and torus.theta_ is not None) else np.pi / 2
+    r0, r1, theta = _physical_lattice(torus)
 
     # Lattice matrix: maps parameter coords (u,v) -> physical coords x = M @ [u,v]
     # e1 = (r0, 0),  e2 = (r1*cos(theta), r1*sin(theta))
@@ -58,32 +153,44 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
 
     if ax is None:
         fig, ax = plt.subplots()
-    # edges — segments computed in [0,1)^2, then mapped to physical space
-    for u, v in (G.edges() if G is not None else []):
-        i, j = idx[u], idx[v]
-        p, q = X[i], X[j]
-        for a, b in torus_edge_segments(p, q):
-            a_phys = M @ a
-            b_phys = M @ b
-            ax.plot([a_phys[0], b_phys[0]], [a_phys[1], b_phys[1]],
-                     color="k", alpha=edge_alpha, lw=edge_lw, zorder=1)
-    # points
+
+    # edges — geodesic segments in [0,1)^2, split where they leave the fundamental domain,
+    # mapped to physical space and drawn as one batched LineCollection. A per-edge ax.plot
+    # loop is unusable at kNN-graph scale, where it would make ~10^5 Line2D artists. The
+    # minimal image comes from the actual lattice, not a per-coordinate wrap, so sheared
+    # tori get the geodesic that is genuinely shortest rather than the rectangular one.
+    if G is not None and G.number_of_edges() > 0:
+        ij = _edge_index_pairs(G)
+        p = X[ij[:, 0]]
+        d = min_image_delta(p, X[ij[:, 1]], r0, r1, theta)
+        ax.add_collection(LineCollection(_torus_edge_segments_batch(p, d, M),
+                                         colors="k", alpha=edge_alpha, linewidths=edge_lw,
+                                         zorder=1, rasterized=rasterized))
+
+    # points. `order` is a draw order for the scatter alone: the edges have to keep the
+    # graph's node order, so it is applied here rather than to X as a whole.
     X_phys = X @ M.T
+    if order is not None:
+        X_phys = X_phys[order]
+        if colors is not None:
+            colors = np.asarray(colors)[order]
     ax.scatter(X_phys[:, 0], X_phys[:, 1], s=s, alpha=node_alpha, zorder=2,
-               c=colors if colors is not None else "blue")
+               c=colors if colors is not None else "blue", linewidths=node_lw,
+               cmap=cmap, vmin=vmin, vmax=vmax, rasterized=rasterized)
 
     # parallelogram boundary of the fundamental domain
     corners = np.array([[0, 0], [1, 0], [1, 1], [0, 1]]) @ M.T
     ax.add_patch(MplPolygon(corners, closed=True, fill=False,
                             edgecolor='gray', lw=1, zorder=3))
 
+    # 'box' (not 'datalim') so the axes box shrinks to the aspect of the torus instead
+    # of inflating the data range, which would pad the panel with whitespace.
     ax.set_aspect('equal', adjustable='box')
     ax.axis('off')
     # --- Tick marks with physical-unit labels on parallelogram edges ---
-    n_ticks   = 5
     tick_ts   = np.linspace(0, 1, n_ticks)
-    tick_size = 0.025 * max(r0, r1)   # tick length in physical units
-    pad       = 0.03  * max(r0, r1)   # gap between tick tip and label
+    tick_size = _TICK_FRAC * max(r0, r1)   # tick length in physical units
+    pad       = _PAD_FRAC  * max(r0, r1)   # gap between tick tip and label
 
     e1_perp = np.array([0.0, -1.0])                      # outward normal to bottom side
     e2_end  = M @ np.array([0.0, 1.0])                   # physical tip of e2
@@ -94,21 +201,30 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
         pt = np.array([t * r0, 0.0])
         tip = pt + tick_size * e1_perp
         ax.plot([pt[0], tip[0]], [pt[1], tip[1]], color='dimgray', lw=0.8, zorder=4)
-        lbl_pos = tip + pad * e1_perp
-        ax.text(lbl_pos[0], lbl_pos[1], f"{t * r0:.3g}",
-                ha='center', va='top', fontsize=8, color='dimgray')
+        if show_tick_labels:
+            lbl_pos = tip + pad * e1_perp
+            ax.text(lbl_pos[0], lbl_pos[1], f"{t * r0:.3g}",
+                    ha='center', va='top', fontsize=tick_fontsize, color='dimgray')
 
-    # Left side (e2): 5 ticks with labels showing physical distance from 0 to r1.
+    # Left side (e2): same ticks, labels showing physical distance from 0 to r1.
     # Skip the t=0 label — already covered by the "0" on the bottom side.
     for t in tick_ts:
         pt = t * e2_end
         tip = pt + tick_size * e2_perp
         ax.plot([pt[0], tip[0]], [pt[1], tip[1]], color='dimgray', lw=0.8, zorder=4)
-        if t > 0:
+        if show_tick_labels and t > 0:
             lbl_pos = tip + pad * e2_perp
             ax.text(lbl_pos[0], lbl_pos[1], f"{t * r1:.3g}",
                     ha='center', va='center', rotation=np.degrees(theta),
-                    fontsize=8, color='dimgray')
+                    fontsize=tick_fontsize, color='dimgray')
+
+    # Explicit limits: matplotlib's autoscale ignores text, so the tick labels would be
+    # clipped. Room is added on the two labelled sides only, and torus_panel_aspect
+    # reproduces the resulting box shape for width_ratios.
+    lo, hi = corners.min(axis=0), corners.max(axis=0)
+    m, label_room = _panel_margins(r0, r1, show_tick_labels)
+    ax.set_xlim(lo[0] - m - label_room, hi[0] + m)
+    ax.set_ylim(lo[1] - m - label_room, hi[1] + m)
     return ax
 
 
@@ -272,39 +388,48 @@ def plot_cover_lifts(p, q, offsets, ax=None, shortest_offset=None, cmap=LIFT_CMA
     return ax
 
 
-def plot_embedding(
-    X,
-    G,
-    s=10,
-    node_alpha=0.9,
-    edge_alpha=0.10,
-    edge_lw=0.4,
-    colors=None,
-    ax=None,
-):
+def plot_embedding(X, G=None,
+                   s=10, node_alpha=0.9, node_lw=None,
+                   edge_alpha=0.10, edge_lw=0.4,
+                   colors=None, cmap=None, vmin=None, vmax=None,
+                   order=None,
+                   ax=None,
+                   rasterized=False):
     """
-    Scatter plot of an embedding with straight edges (no torus wrapping).
+    Scatter + straight edges for a flat (non-torus) embedding.
 
-    X : (N, 2) embedding — wrapped to [0,1]^2 for display.
-    G : networkx graph whose node order matches rows of X.
+    The companion of plot_embedding_with_torus_edges for layouts that live in the plane,
+    e.g. Euclidean MDS. Coordinates are used as given — no wrapping, no fundamental
+    domain — and the axes are left autoscaled at equal aspect, so this shares a figure
+    with torus panels without either one dictating the other's limits. Every other
+    argument means what it does there, `order` included: a draw order for the scatter
+    alone, since the edges have to keep the graph's node order.
+
+    X : (N, 2) embedding.
+    G : optional networkx graph whose node order matches the rows of X.
     """
-    X = np.asarray(X, dtype=np.float64) % 1.0
-    idx = {n: i for i, n in enumerate(G.nodes())}
+    X = np.asarray(X, dtype=np.float64)
 
     if ax is None:
         _, ax = plt.subplots()
 
-    for u, v in G.edges():
-        i, j = idx[u], idx[v]
-        p, q = X[i], X[j]
-        ax.plot([p[0], q[0]], [p[1], q[1]],
-                color="k", alpha=edge_alpha, lw=edge_lw, zorder=1)
+    if G is not None and G.number_of_edges() > 0:
+        # X[ij] is already the (E, 2, 2) segment array LineCollection wants
+        ax.add_collection(LineCollection(X[_edge_index_pairs(G)], colors="k",
+                                         alpha=edge_alpha, linewidths=edge_lw, zorder=1,
+                                         rasterized=rasterized))
 
-    ax.scatter(X[:, 0], X[:, 1], s=s, alpha=node_alpha, zorder=2,
-               c=colors if colors is not None else "blue")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    plt.tight_layout()
+    P = X
+    if order is not None:
+        P = P[order]
+        if colors is not None:
+            colors = np.asarray(colors)[order]
+    ax.scatter(P[:, 0], P[:, 1], s=s, alpha=node_alpha, zorder=2, linewidths=node_lw,
+               c=colors if colors is not None else "blue",
+               cmap=cmap, vmin=vmin, vmax=vmax, rasterized=rasterized)
+
+    ax.set_aspect('equal', adjustable='box')
+    ax.autoscale_view()
     return ax
 
 

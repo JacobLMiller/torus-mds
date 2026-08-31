@@ -456,6 +456,40 @@ def torus_delta(p, q):
     return ((q - p + 0.5) % 1.0) - 0.5
 
 
+def min_image_delta(P, Q, r0=1.0, r1=1.0, theta=np.pi / 2):
+    """
+    Shortest displacement from P to Q on the flat torus with lattice basis
+    b0 = (r0, 0), b1 = (r1*cos(theta), r1*sin(theta)). Vectorized over leading axes.
+
+    P, Q are parameter-space coordinates in [0,1)^2 and the result is in the same
+    parameter space, so the physical displacement is M @ delta. A common scale factor on
+    (r0, r1) does not change the answer, only their ratio and the angle do.
+
+    The per-coordinate wrap of ``torus_delta`` is the exact answer only for an orthogonal
+    basis, where the metric separates. Sheared lattices need a search over the four
+    neighbouring images, exact for a Gauss-reduced basis or an equal-side rhombus with
+    theta in [60, 120] degrees. This is the vectorized counterpart of the scalar
+    ``_min_image_offset`` used by the SGD kernels, and selects the same image.
+    """
+    D = torus_delta(np.asarray(P, dtype=np.float64), np.asarray(Q, dtype=np.float64))
+    cos_t = np.cos(theta)
+    if abs(cos_t) < 1e-12:
+        return D
+
+    g00, g01, g11 = r0 * r0, r0 * r1 * cos_t, r1 * r1
+    a, b = D[..., 0], D[..., 1]
+    # The wrap already put (a, b) in [-1/2, 1/2); the other candidate per axis is the
+    # image one lattice step away, on whichever side is nearer.
+    a1 = np.where(a >= 0.0, a - 1.0, a + 1.0)
+    b1 = np.where(b >= 0.0, b - 1.0, b + 1.0)
+    cand = np.stack([np.stack([a, b], axis=-1), np.stack([a1, b], axis=-1),
+                     np.stack([a, b1], axis=-1), np.stack([a1, b1], axis=-1)])
+    u, v = cand[..., 0], cand[..., 1]
+    quad = g00 * u * u + 2.0 * g01 * u * v + g11 * v * v
+    best = np.argmin(quad, axis=0)
+    return np.take_along_axis(cand, best[None, ..., None], axis=0)[0]
+
+
 def torus_edge_segments(p, q, offset=None, eps=1e-12):
     """
     Return list of (a_plot, b_plot) segments for a straight torus geodesic between p and q,

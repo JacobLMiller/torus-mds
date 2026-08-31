@@ -15,6 +15,7 @@ from .geometry import (
     rect_stress_and_grad,
     parallelogram_grad,
     torus_delta,
+    min_image_delta,
     torus_edge_segments,
 )
 from .projector import (
@@ -34,6 +35,7 @@ from .metrics import (
 )
 from .visualization import (
     plot_embedding_with_torus_edges,
+    torus_panel_aspect,
     plot_embedding,
     plot_torus_lifts,
     plot_cover_lifts,
