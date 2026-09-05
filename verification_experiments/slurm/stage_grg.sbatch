@@ -1,0 +1,52 @@
+#!/bin/bash
+#SBATCH --job-name=torus-stage-grg
+#SBATCH --partition=compute
+#SBATCH --cpus-per-task=2
+#SBATCH --time=00:30:00
+#SBATCH --mem=2G
+#SBATCH --output=slurm_logs/stage_grg_%j.out
+#SBATCH --error=slurm_logs/stage_grg_%j.err
+#
+# One-off staging job (not an array): pregenerates GRG graphs for one
+# (N_MIN, N_MAX) size tier and caches them as graph_<idx>.npz + manifest.csv
+# under OUTPUT_DIR. No network needed, unlike stage_suitesparse.sbatch.
+#
+# Submit once per size tier from the repo root, e.g.:
+#   sbatch --export=ALL,N_MIN=100,N_MAX=1000,N_GRAPHS=450 \
+#       verification_experiments/slurm/stage_grg.sbatch
+#
+# GRAPH_TYPE_WEIGHTS contains commas, so (as with run_embed_array.sbatch)
+# export it as a shell variable first rather than putting it inside
+# --export=ALL,KEY=val,... -- sbatch --export splits on every comma in the
+# whole argument:
+#   export GRAPH_TYPE_WEIGHTS="1,1,0"
+#   sbatch --export=ALL,N_MIN=100,N_MAX=1000,N_GRAPHS=450 \
+#       verification_experiments/slurm/stage_grg.sbatch
+#
+# Resumable: stage_grg.py checkpoints its manifest, so if this hits the
+# time limit or gets killed partway, just resubmit -- it picks up where it
+# left off rather than regenerating already-staged graphs.
+#
+# Afterwards, point run_embed_array.sbatch at the cache via
+# --export=ALL,FAMILY=grg,N_MIN=...,N_MAX=...,CACHE_DIR=...,NUM_SHARDS=...
+# instead of GRAPHS_PER_SHARD (see slurm/README.md).
+
+set -euo pipefail
+
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
+cd "$REPO_ROOT"
+
+source "${MINIFORGE_ROOT:-$HOME/nobackup/miniforge3}/etc/profile.d/conda.sh"
+conda activate torus-mds
+
+N_MIN="${N_MIN:?Set N_MIN via --export}"
+N_MAX="${N_MAX:?Set N_MAX via --export}"
+N_GRAPHS="${N_GRAPHS:?Set N_GRAPHS via --export}"
+
+python verification_experiments/stage_grg.py \
+    --n-graphs "$N_GRAPHS" \
+    --n-min "$N_MIN" --n-max "$N_MAX" \
+    --eps-min "${EPS_MIN:-0.10}" --eps-max "${EPS_MAX:-0.40}" --n-eps "${N_EPS:-6}" \
+    --graph-type-weights "${GRAPH_TYPE_WEIGHTS:-1,1,1}" \
+    --seed "${SEED:-0}" \
+    --output-dir "${OUTPUT_DIR:-data/grg_cache/${N_MIN}_${N_MAX}}"

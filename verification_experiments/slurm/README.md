@@ -75,6 +75,49 @@ python verification_experiments/stage_suitesparse.py \
     --output-dir data/suitesparse_cache
 ```
 
+## 0b. Stage SBM/GRG (optional, once per size tier)
+
+Unlike SuiteSparse (a fixed real-world pool that must be downloaded), SBM
+and GRG graphs are synthetic and can be generated on the fly inside the
+embed job itself (the default, described in step 1 below). For a final run
+where you want a graph set that's fixed up front -- reproducible across
+reruns/reshards, and decoupled from the embed job's own time budget --
+pregenerate them instead with `stage_sbm.py`/`stage_grg.py`, which cache
+each graph as a `graph_<idx>.npz` (same lightweight sparse-adjacency format
+`stage_suitesparse.py` uses) plus a `manifest.csv`, mirroring the SuiteSparse
+cache layout. No network needed, so this can run directly on the login node
+for small tiers, or as its own job for the larger ones:
+
+```bash
+sbatch --export=ALL,N_MIN=100,N_MAX=1000,N_GRAPHS=336 \
+    verification_experiments/slurm/stage_sbm.sbatch
+sbatch --export=ALL,N_MIN=1000,N_MAX=3000,N_GRAPHS=336 \
+    verification_experiments/slurm/stage_sbm.sbatch
+sbatch --export=ALL,N_MIN=3000,N_MAX=10000,N_GRAPHS=336 \
+    verification_experiments/slurm/stage_sbm.sbatch
+
+sbatch --export=ALL,N_MIN=100,N_MAX=1000,N_GRAPHS=336 \
+    verification_experiments/slurm/stage_grg.sbatch
+sbatch --export=ALL,N_MIN=1000,N_MAX=3000,N_GRAPHS=336 \
+    verification_experiments/slurm/stage_grg.sbatch
+sbatch --export=ALL,N_MIN=3000,N_MAX=10000,N_GRAPHS=336 \
+    verification_experiments/slurm/stage_grg.sbatch
+```
+
+(`N_GRAPHS` here is the tier's *total*, unlike step 1's `GRAPHS_PER_SHARD`
+which is per-shard -- staging isn't sharded, so there's no shard count to
+divide by. Each defaults its cache dir to `data/{sbm,grg}_cache/<n_min>_<n_max>`;
+override with `OUTPUT_DIR`.) `stage_grg.sbatch` also takes `EPS_MIN`,
+`EPS_MAX`, `N_EPS`, and `GRAPH_TYPE_WEIGHTS` (export as a shell variable, not
+inside `--export=ALL,...`, since its commas would otherwise be split -- see
+step 1's GRG example). Resumable like `stage_suitesparse.py`: a killed or
+resubmitted job picks up where it left off.
+
+Then point step 1's `run_embed_array.sbatch` at the cache via `CACHE_DIR`
+and `NUM_SHARDS` instead of `GRAPHS_PER_SHARD` -- shown inline below.
+Skip this whole section (and just use `GRAPHS_PER_SHARD` as step 1 already
+does) if you don't need a fixed graph set.
+
 ## 1. Submit embedding jobs
 
 **Run every `sbatch` command below from the repo root.** The scripts derive
@@ -117,6 +160,18 @@ sbatch --array=0-2 --time=03:00:00 --mem=8G \
 ```
 
 Repeat with `FAMILY=grg`.
+
+If you staged a fixed pool in step 0b instead, swap `GRAPHS_PER_SHARD` for
+`CACHE_DIR` (the staging dir) and `NUM_SHARDS` (must match `--array`'s shard
+count, same as SuiteSparse's `NUM_SHARDS` below) -- the array interleaves
+across the pregenerated graphs by `exp_idx % NUM_SHARDS` instead of each
+shard generating its own:
+
+```bash
+sbatch --array=0-2 --time=00:20:00 --mem=2G \
+    --export=ALL,FAMILY=sbm,N_MIN=100,N_MAX=1000,CACHE_DIR=data/sbm_cache/100_1000,NUM_SHARDS=3 \
+    verification_experiments/slurm/run_embed_array.sbatch
+```
 
 By default each family runs all three methods (`TorusMDS s_gd2 wrap_python`).
 Restrict via `--export=ALL,...,METHODS="TorusMDS s_gd2"` (space-separated,
