@@ -40,9 +40,10 @@ DEFAULT_METHOD_MAX_N: dict[str, int | None] = {
 # is unchanged -- these are opt-in via an explicit --methods list.
 ASPECT_INIT_VARIANTS: dict[str, tuple[str, int, float]] = {
     "TorusMDS_smart_1x": ("smart", 1, 1.0),
-    "TorusMDS_smart_100x": ("smart", 100, 1.0),
+    "TorusMDS_smart_1x_scale2": ("smart", 1, 2.0),
+    "TorusMDS_smart_1x_scale4": ("smart", 1, 4.0),
+    "TorusMDS_smart_1x_scale10": ("smart", 1, 10.0),
     "TorusMDS_random_1x": ("random", 1, 1.0),
-    "TorusMDS_random_100x": ("random", 100, 1.0),
     "TorusMDS_random_1x_scale2": ("random", 1, 2.0),
     "TorusMDS_random_1x_scale4": ("random", 1, 4.0),
     "TorusMDS_random_1x_scale10": ("random", 1, 10.0),
