@@ -2,7 +2,7 @@
 #SBATCH --job-name=torus-embed
 #SBATCH --partition=compute
 #SBATCH --cpus-per-task=2
-#SBATCH --time=00:30:00
+#SBATCH --time=03:30:00
 #SBATCH --mem=4G
 #SBATCH --array=0-9
 #SBATCH --output=slurm_logs/embed_%x_%A_%a.out
