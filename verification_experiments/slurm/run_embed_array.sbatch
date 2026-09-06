@@ -22,6 +22,7 @@ conda activate torus-mds
 
 FAMILY="${FAMILY:?Set FAMILY=sbm|grg|suitesparse via --export}"
 SHARD="${SLURM_ARRAY_TASK_ID}"
+LAYOUTS_ROOT="${LAYOUTS_ROOT:-layouts}"
 TORUS_MAX_ITERS="${TORUS_MAX_ITERS:-2000}"
 WRAP_PYTHON_MAX_N="${WRAP_PYTHON_MAX_N:-3500}"
 SEED_BASE="${SEED_BASE:-0}"
@@ -29,10 +30,12 @@ STRESS_MODE="${STRESS_MODE:-raw}"
 METHODS="${METHODS:-TorusMDS s_gd2 wrap_python}"
 
 # Runs that deviate from the (raw, 2000-iter) default land in a
-# distinctly-named layouts/ subdir so they don't collide with -- or get
-# skipped as already-done against -- manifests from a different
-# configuration on the same graphs (e.g. a normalized-stress or
-# iteration-count ablation sharing the same FAMILY/N_MIN/N_MAX).
+# distinctly-named subdir under LAYOUTS_ROOT (default "layouts") so they
+# don't collide with -- or get skipped as already-done against -- manifests
+# from a different configuration on the same graphs (e.g. a normalized-stress
+# or iteration-count ablation sharing the same FAMILY/N_MIN/N_MAX). Override
+# LAYOUTS_ROOT via --export if you want this run's output kept separate from
+# an existing layouts/ tree entirely, rather than relying on that suffix.
 FAMILY_SUBDIR="$FAMILY"
 if [ "$STRESS_MODE" != "raw" ]; then
   FAMILY_SUBDIR="${FAMILY_SUBDIR}_${STRESS_MODE}"
@@ -55,7 +58,7 @@ case "$FAMILY" in
         --stress-mode "$STRESS_MODE" \
         --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
         --methods $METHODS \
-        --output-dir "layouts/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}"
+        --output-dir "${LAYOUTS_ROOT}/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}"
     else
       GRAPHS_PER_SHARD="${GRAPHS_PER_SHARD:?Set GRAPHS_PER_SHARD via --export}"
       python verification_experiments/sbm_comparison.py \
@@ -65,7 +68,7 @@ case "$FAMILY" in
         --stress-mode "$STRESS_MODE" \
         --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
         --methods $METHODS \
-        --output-dir "layouts/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}" \
+        --output-dir "${LAYOUTS_ROOT}/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}" \
         --seed "$((SEED_BASE + SHARD))"
     fi
     ;;
@@ -82,7 +85,7 @@ case "$FAMILY" in
         --stress-mode "$STRESS_MODE" \
         --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
         --methods $METHODS \
-        --output-dir "layouts/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}"
+        --output-dir "${LAYOUTS_ROOT}/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}"
     else
       GRAPHS_PER_SHARD="${GRAPHS_PER_SHARD:?Set GRAPHS_PER_SHARD via --export}"
       GRAPH_TYPE_WEIGHTS="${GRAPH_TYPE_WEIGHTS:-1,1,1}"
@@ -94,7 +97,7 @@ case "$FAMILY" in
         --stress-mode "$STRESS_MODE" \
         --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
         --methods $METHODS \
-        --output-dir "layouts/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}" \
+        --output-dir "${LAYOUTS_ROOT}/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}" \
         --seed "$((SEED_BASE + SHARD))"
     fi
     ;;
@@ -107,7 +110,7 @@ case "$FAMILY" in
       --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
       --stress-mode "$STRESS_MODE" \
       --methods $METHODS \
-      --output-dir "layouts/${FAMILY_SUBDIR}/shard_${SHARD}"
+      --output-dir "${LAYOUTS_ROOT}/${FAMILY_SUBDIR}/shard_${SHARD}"
     ;;
   *)
     echo "Unknown FAMILY=$FAMILY (expected sbm|grg|suitesparse)" >&2
