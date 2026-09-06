@@ -58,8 +58,8 @@ if __name__ == "__main__":
                         help="This shard's index in [0, num_shards) for SLURM array parallelism (default: 0)")
     parser.add_argument("--num-shards", type=int, default=1,
                         help="Total number of shards (default: 1, i.e. no sharding)")
-    parser.add_argument("--torus-max-iters", type=int, default=2000,
-                        help="SGD iterations for TorusMDS (default: 2000)")
+    parser.add_argument("--torus-max-iters", type=int, default=10000,
+                        help="SGD iterations for TorusMDS (default: 10000)")
     parser.add_argument("--stress-mode", type=str, default="raw", choices=["raw", "normalized"],
                         help="TorusMDS training objective: 'raw' minimizes sum((alpha*r-d)^2), "
                              "'normalized' minimizes sum((alpha*r-d)^2 / d^2) (default: raw)")
