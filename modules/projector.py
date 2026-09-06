@@ -559,7 +559,7 @@ def sgd_minibatch_njit(
     chunk_epochs=DEFAULT_SEQUENCE_CHUNK_EPOCHS,
     lr_warmup_init=10.0,
     lr_warmup_decay=25.0,
-    tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
+    tol: float = 1e-6,     # relative stress improvement threshold (0 = disabled)
     patience: int = 5,    # non-improving chunks before stopping
     time_limit_seconds: Optional[float] = None,
     run_info: Optional[dict] = None,
