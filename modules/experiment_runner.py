@@ -16,7 +16,7 @@ import scipy.sparse as sp
 from standalone_toruslayout import wrap_python, wrap_ts
 
 from .graphio import apsp_distance_matrix
-from .initialization import find_fundamental_torus_directions
+from .initialization import find_fundamental_torus_directions, rect_torus_init_from_spectral
 from .projector import LearnMode, MDSTorusProjector
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,14 @@ ASPECT_INIT_VARIANTS: dict[str, tuple[str, int, float]] = {
 }
 
 DEFAULT_ASPECT_MAX_N: dict[str, int | None] = {name: None for name in ASPECT_INIT_VARIANTS}
+
+# The "smart" spectral init evaluated directly, with no SGD refinement --
+# isolates how good the initialization alone is. Shares the same per-graph
+# D/spectral_result cache as the "smart" ASPECT_INIT_VARIANTS (see the
+# run_embeddings loop below), so its only real cost is the spectral
+# decomposition itself, not an SGD loop -- cheap enough to run standalone.
+# Opt-in like ASPECT_INIT_VARIANTS/WRAP_VARIANTS.
+SPECTRAL_INIT_ONLY_METHOD = "TorusMDS_spectral_init"
 
 # Standalone layout variants are opt-in, like ASPECT_INIT_VARIANTS
 WRAP_VARIANTS: tuple[str, ...] = ("wrap_typescript", "wrap_python_newdist")
@@ -321,6 +329,18 @@ def run_embeddings(
                         spectral_result=spectral_result, max_iters=torus_max_iters,
                         seed=seed, stress_mode=torus_stress_mode,
                     )
+                elif method == SPECTRAL_INIT_ONLY_METHOD:
+                    if D is None:
+                        D, _ = apsp_distance_matrix(G)
+                    if spectral_result is None and not spectral_failed:
+                        try:
+                            spectral_result = find_fundamental_torus_directions(D / D.max())
+                        except Exception:
+                            spectral_failed = True
+                    if spectral_failed:
+                        raise RuntimeError("spectral init failed for this graph")
+                    X, r0_fit, r1_fit = rect_torus_init_from_spectral(spectral_result)
+                    alpha_fit = float("nan")
                 elif method == "wrap_python":
                     X = embed_wrap_python(G, max_iters=wrap_python_max_iters, seed=seed)
                     alpha_fit = r0_fit = r1_fit = float("nan")

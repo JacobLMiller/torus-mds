@@ -559,7 +559,7 @@ def sgd_minibatch_njit(
     chunk_epochs=DEFAULT_SEQUENCE_CHUNK_EPOCHS,
     lr_warmup_init=10.0,
     lr_warmup_decay=25.0,
-    tol: float = 1e-6,     # relative stress improvement threshold (0 = disabled)
+    tol: float = 1e-4,     # relative stress improvement threshold (0 = disabled)
     patience: int = 5,    # non-improving chunks before stopping
     time_limit_seconds: Optional[float] = None,
     run_info: Optional[dict] = None,
@@ -844,7 +844,7 @@ class MDSTorusProjector(TorusProjector):
             lr_warmup_init: float | Literal["auto"] | None = "auto",
             lr_warmup_decay: float = 25.0,  # e-folding scale (epochs) of the warmup
             # --- convergence criteria ---
-            tol: float = 0.0,     # relative stress improvement threshold (0 = disabled)
+            tol: float = 1e-4,     # relative stress improvement threshold (0 = disabled)
             patience: int = 5,    # non-improving chunks before stopping
             # Cooperative SGD wall-time budget; L-BFGS polishing
             # is skipped when set because SciPy cannot be stopped safely mid-run.

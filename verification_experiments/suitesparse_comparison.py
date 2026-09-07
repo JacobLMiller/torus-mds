@@ -24,7 +24,9 @@ import networkx as nx
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from modules.experiment_runner import ASPECT_INIT_VARIANTS, METHODS, GraphRecord, load_graph, run_embeddings
+from modules.experiment_runner import (
+    ASPECT_INIT_VARIANTS, METHODS, SPECTRAL_INIT_ONLY_METHOD, GraphRecord, load_graph, run_embeddings,
+)
 
 
 def suitesparse_graph_iterator(cache_dir: str, shard_index: int, num_shards: int):
@@ -64,7 +66,7 @@ if __name__ == "__main__":
                         help="TorusMDS training objective: 'raw' minimizes sum((alpha*r-d)^2), "
                              "'normalized' minimizes sum((alpha*r-d)^2 / d^2) (default: raw)")
     parser.add_argument("--methods", type=str, nargs="+", default=list(METHODS),
-                        choices=list(METHODS) + list(ASPECT_INIT_VARIANTS),
+                        choices=list(METHODS) + list(ASPECT_INIT_VARIANTS) + [SPECTRAL_INIT_ONLY_METHOD],
                         help=f"Which methods to run, space-separated (default: all of {list(METHODS)}; "
                              f"also available: {list(ASPECT_INIT_VARIANTS)})")
     parser.add_argument("--wrap-python-max-iters", type=int, default=200,
