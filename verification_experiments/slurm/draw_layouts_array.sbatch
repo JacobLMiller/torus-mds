@@ -2,7 +2,7 @@
 #SBATCH --job-name=torus-draw
 #SBATCH --partition=compute
 #SBATCH --cpus-per-task=1
-#SBATCH --time=00:30:00
+#SBATCH --time=01:30:00
 #SBATCH --mem=2G
 #SBATCH --array=0-9
 #SBATCH --output=slurm_logs/draw_%x_%A_%a.out

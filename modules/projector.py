@@ -32,7 +32,10 @@ from .geometry import (
     torus_grad,
 )
 
-DEFAULT_SEQUENCE_CHUNK_EPOCHS = 128
+DEFAULT_SEQUENCE_CHUNK_EPOCHS = 16  # dispatch/batching granularity -- measured no performance
+                                     # difference down to 4 on a 10000-iteration run, so this is
+                                     # sized for fine-grained convergence checking (see window_iters),
+                                     # not a real performance constraint
 
 
 class LearnMode(IntEnum):
@@ -378,12 +381,16 @@ def _run_pair_sequence_online_njit(
     y_init=1.0,
     lr_warmup_init=10.0,
     lr_warmup_decay=25.0,
+    lr_tail_power=2.0,        # tail decays as 1/(1+learning_rate*epoch)^lr_tail_power; 1.0 = old harmonic decay
     normalize=False,
     bounded=True,
     pair_step_cap=0.10,       # Max fractional-coordinate displacement of either endpoint per pair.
     batch_profile_alpha=False,
     sampling_gamma=0.0,
     sampling_correction=1.0,
+    alpha_ema_floor=0.02,     # late-training EMA weight for the batch-profiled alpha estimate
+    alpha_ema_decay=200.0,    # e-folding scale (epochs) from snapping (weight 1) toward alpha_ema_floor
+    freeze_geometry=False,    # skip the geom_lr aspect update and alpha re-profiling entirely this chunk
 ):
     params = init.copy()
     alpha = alpha_init
@@ -420,8 +427,8 @@ def _run_pair_sequence_online_njit(
             tail_progress = pairs_seen / total_pairs
         step_pos = max(
             lr_warmup_init * np.exp(-global_it / lr_warmup_decay)
-            + learning_rate / (1.0 + learning_rate * global_it),
-            1e-4,
+            + learning_rate / (1.0 + learning_rate * global_it) ** lr_tail_power,
+            1e-10,
         )
         if learn_mode == 4:
             r0 = np.exp(-0.5 * log_aspect)
@@ -512,7 +519,7 @@ def _run_pair_sequence_online_njit(
         params %= 1.0
         pairs_seen += used
 
-        if used > 0:
+        if used > 0 and not freeze_geometry:
             if learn_mode == 4:
                 grad_s = (-0.5 * gr0_sum * r0 + 0.5 * gr1_sum * r1) / used
                 log_aspect -= geom_lr * grad_s
@@ -528,11 +535,22 @@ def _run_pair_sequence_online_njit(
                     alpha, x, y, y_raw, geom_lr,
                 )
             if batch_profile_alpha and learn_mode in (1, 4, 5, 6):
-                # Profile on the completed, wrapped batch layout.
-                alpha = _profile_alpha_pairs_njit(
+                # Profile on the completed, wrapped batch layout, then EMA-blend
+                # into the running alpha instead of replacing it outright: each
+                # epoch's profile is an exact least-squares fit, but only over
+                # that epoch's small pair batch, so a hard replace leaves alpha
+                # (and hence stress, which scales with it) jittering by its full
+                # per-batch sampling noise forever, even once the layout has
+                # settled. ema_weight starts at 1 (full snap -- matches a hard
+                # replace while the geometry is still moving fast) and decays
+                # toward alpha_ema_floor (heavy smoothing, damping that noise
+                # once training has had time to settle).
+                alpha_hat = _profile_alpha_pairs_njit(
                     data, params, seq, r0, r1, x, y, use_rect, eps, normalize,
                     sampling_gamma, sampling_correction,
                 )
+                ema_weight = alpha_ema_floor + (1.0 - alpha_ema_floor) * np.exp(-global_it / alpha_ema_decay)
+                alpha = (1.0 - ema_weight) * alpha + ema_weight * alpha_hat
                 alpha = max(alpha_min, min(alpha_max, alpha))
 
     return params, alpha, r0, r1, x, y
@@ -559,8 +577,14 @@ def sgd_minibatch_njit(
     chunk_epochs=DEFAULT_SEQUENCE_CHUNK_EPOCHS,
     lr_warmup_init=10.0,
     lr_warmup_decay=25.0,
-    tol: float = 1e-4,     # relative stress improvement threshold (0 = disabled)
-    patience: int = 5,    # non-improving chunks before stopping
+    lr_tail_power=2.0,        # tail decays as 1/(1+learning_rate*epoch)^lr_tail_power; 1.0 = old harmonic decay
+    tol: float = 1e-4,     # coefficient-of-variation (std/mean) threshold over the trailing stress window (0 = disabled)
+    window_iters: int = 320,  # trailing span, in iterations, the coefficient of variation is computed over --
+                              # independent of chunk_epochs (a batching/dispatch granularity, not a convergence
+                              # concept); converted to a check-count internally since checks land every
+                              # chunk_epochs. 320/16 = 20 checks -- enough samples for the CV estimate itself
+                              # to not be too noisy, not a span chosen to "wait out" the noise floor.
+    record_history: bool = False,  # log (iteration, stress) at every check, regardless of tol
     time_limit_seconds: Optional[float] = None,
     run_info: Optional[dict] = None,
     init=None,
@@ -568,6 +592,12 @@ def sgd_minibatch_njit(
     bounded=True,
     pair_step_cap=0.10,
     normalized_pair_sampling="auto",
+    alpha_ema_floor=0.02,     # late-training EMA weight for the batch-profiled alpha estimate
+    alpha_ema_decay=200.0,    # e-folding scale (epochs) from snapping (weight 1) toward alpha_ema_floor
+    alpha_freeze_tol=1e-3,    # freeze geometry once alpha's own windowed CV drops below this -- deliberately
+                              # looser than `tol` can be, since alpha (even EMA-damped) has its own achievable
+                              # noise floor; requiring it to clear an arbitrarily tight `tol` would mean it
+                              # never freezes at exactly the tolerances that most need it to.
 ):
     """
     Minibatch SGD for torus MDS using online pair updates.
@@ -648,10 +678,14 @@ def sgd_minibatch_njit(
             sampling_correction = float(pair_weights.mean())
             alias_accept, alias_index = _build_weighted_pair_alias(pair_weights / pair_weights.sum())
 
+    window = max(1, int(window_iters / chunk_epochs))
     stress_sample = None
-    bad_chunks = 0
-    prev_stress = np.inf
-    if tol > 0.0:
+    stress_window: list = []
+    alpha_window: list = []
+    geometry_frozen = False
+    history: list = []
+    track = tol > 0.0 or record_history
+    if track:
         num_pairs = n * (n - 1) // 2
         n_stress = min(max(256, batch_pairs), num_pairs)
         stress_rng = np.random.default_rng(seed)
@@ -667,7 +701,7 @@ def sgd_minibatch_njit(
             time_limit_reached = True
             termination_reason = "time_limit"
             break
-        until_check = next_check - start_iter if tol > 0.0 else max_iters - start_iter
+        until_check = next_check - start_iter if track else max_iters - start_iter
         epochs = min(chunk_epochs, until_check, max_iters - start_iter)
         if weighted_sampling:
             sequence = _build_weighted_pair_sequence_from_pairs(
@@ -710,12 +744,16 @@ def sgd_minibatch_njit(
             y_init=y,
             lr_warmup_init=lr_warmup_init,
             lr_warmup_decay=lr_warmup_decay,
+            lr_tail_power=lr_tail_power,
             normalize=normalize,
             bounded=bounded,
             pair_step_cap=pair_step_cap,
             batch_profile_alpha=True,
             sampling_gamma=sampling_gamma,
             sampling_correction=sampling_correction,
+            alpha_ema_floor=alpha_ema_floor,
+            alpha_ema_decay=alpha_ema_decay,
+            freeze_geometry=geometry_frozen,
         )
         start_iter += epochs
         if (
@@ -727,19 +765,53 @@ def sgd_minibatch_njit(
             termination_reason = "time_limit"
             break
 
-        if tol > 0.0 and start_iter == next_check:
+        if track and start_iter == next_check:
             curr_stress = _batch_stress_njit(
                 data, params, stress_sample, alpha, r0, r1, x, y, use_rect, eps, normalize
             )
-            rel_change = abs(prev_stress - curr_stress) / max(prev_stress, 1e-12)
-            if rel_change < tol:
-                bad_chunks += 1
-                if bad_chunks >= patience:
-                    termination_reason = "tolerance"
-                    break
-            else:
-                bad_chunks = 0
-            prev_stress = curr_stress
+            converged = False
+            if tol > 0.0:
+                # Freeze geometry (alpha/r0/r1) once it's been stable over a full
+                # window: alpha is only ever known via a noisy per-epoch batch
+                # profile (EMA-damped, not eliminated -- see alpha_ema_* above),
+                # so once it's genuinely settled, continuing to re-estimate it
+                # just spends the rest of the run re-adding noise it can no
+                # longer reduce. Freezing removes that noise source from the
+                # stress trajectory entirely, rather than merely damping it,
+                # decoupling "has geometry settled" from "have positions settled"
+                # into two simpler questions instead of one that conflates them.
+                if not geometry_frozen and learn_mode in (1, 4, 5, 6):
+                    alpha_window.append(alpha)
+                    if len(alpha_window) > window:
+                        alpha_window.pop(0)
+                    if len(alpha_window) == window:
+                        aw = np.asarray(alpha_window)
+                        if aw.std() / max(abs(aw.mean()), 1e-12) < alpha_freeze_tol:
+                            geometry_frozen = True
+
+                stress_window.append(curr_stress)
+                if len(stress_window) > window:
+                    stress_window.pop(0)
+                # Wait for a full window before judging stability -- position
+                # steps decay but never fully reach zero (see step_pos above),
+                # so the stress trajectory never truly settles to a fixed point;
+                # a single point-to-point comparison is fragile against that
+                # residual noise. Coefficient of variation over a trailing
+                # window instead asks whether stress has been *stably* flat
+                # over the last `window_iters` iterations (`window` checks,
+                # window_iters/chunk_epochs of them), not just quiet since the
+                # one check before it.
+                if len(stress_window) == window:
+                    w = np.asarray(stress_window)
+                    cv = w.std() / max(w.mean(), 1e-12)
+                    if cv < tol:
+                        termination_reason = "tolerance"
+                        converged = True
+            if record_history:
+                history.append((start_iter, float(curr_stress), float(r0), float(r1),
+                                 float(alpha), geometry_frozen))
+            if converged:
+                break
             next_check += chunk_epochs
 
     if termination_reason is None:
@@ -752,6 +824,8 @@ def sgd_minibatch_njit(
             elapsed_seconds=time.perf_counter() - started_at,
             termination_reason=termination_reason,
         )
+        if record_history:
+            run_info["stress_history"] = history
     return params, alpha, r0, r1, x, y
 
 
@@ -785,6 +859,7 @@ class TorusProjector:
     sgd_elapsed_seconds_: Optional[float] = field(default=None, init=False)
     n_iter_: Optional[int] = field(default=None, init=False)
     termination_reason_: Optional[str] = field(default=None, init=False)
+    stress_history_: Optional[list] = field(default=None, init=False)
 
     def fit_transform(self, D: np.ndarray, **kwargs) -> np.ndarray:
         D = _check_distance_matrix(D)
@@ -835,6 +910,23 @@ class MDSTorusProjector(TorusProjector):
             r1_init=1.0,
             learn_mode: LearnMode = LearnMode.ALPHA,
             geom_lr=0.01,
+            # --- alpha (scale) profiling schedule ---
+            # Each epoch profiles the exact least-squares alpha on that epoch's
+            # pair batch, then EMA-blends it into the running alpha rather than
+            # replacing it outright, so alpha snaps to the batch estimate early
+            # (weight ~1, when the layout is still moving) and is heavily
+            # smoothed later (weight -> alpha_ema_floor once it's settled,
+            # damping the batch estimate's per-epoch sampling noise instead of
+            # tracking it forever).
+            alpha_ema_floor=0.02,     # late-training EMA weight
+            alpha_ema_decay=200.0,    # e-folding scale (epochs) from snapping to alpha_ema_floor
+            # Once alpha's own windowed CV drops below this, freeze it (and r0/r1)
+            # for the rest of the run instead of continuing to re-profile it --
+            # deliberately looser than `tol` can be, since alpha has its own
+            # achievable noise floor even with EMA damping; requiring it to also
+            # clear an arbitrarily tight `tol` would mean it never freezes at
+            # exactly the tolerances that most need it to.
+            alpha_freeze_tol=1e-3,
             theta=90.0,           # torus angle in degrees; must be in [60, 120]
             init=None,            # optional (N, 2) initial positions in [0,1)^2 or spectral initialization dict
             learning_rate: float | Literal["auto"] | None = "auto",
@@ -843,9 +935,12 @@ class MDSTorusProjector(TorusProjector):
             # --- position step-size schedule ---
             lr_warmup_init: float | Literal["auto"] | None = "auto",
             lr_warmup_decay: float = 25.0,  # e-folding scale (epochs) of the warmup
+            lr_tail_power: float = 2.0,  # tail decays as 1/(1+learning_rate*epoch)^lr_tail_power (1.0 = old harmonic decay)
             # --- convergence criteria ---
-            tol: float = 1e-4,     # relative stress improvement threshold (0 = disabled)
-            patience: int = 5,    # non-improving chunks before stopping
+            tol: float = 1e-4,     # coefficient-of-variation (std/mean) threshold over the trailing stress window (0 = disabled)
+            window_iters: int = 320,  # trailing span, in iterations, the coefficient of variation is computed over
+                                      # (320/chunk_epochs=16 -> 20 checks worth of samples)
+            record_history: bool = False,  # log (iteration, stress) at every check, regardless of tol
             # Cooperative SGD wall-time budget; L-BFGS polishing
             # is skipped when set because SciPy cannot be stopped safely mid-run.
             time_limit_seconds: Optional[float] = None,
@@ -987,10 +1082,15 @@ class MDSTorusProjector(TorusProjector):
             y_init=y0,
             lr_warmup_init=lr_warmup_init,
             lr_warmup_decay=lr_warmup_decay,
+            lr_tail_power=lr_tail_power,
             normalize=normalize,
+            alpha_ema_floor=alpha_ema_floor,
+            alpha_ema_decay=alpha_ema_decay,
+            alpha_freeze_tol=alpha_freeze_tol,
         )
         kwargs["tol"] = tol
-        kwargs["patience"] = patience
+        kwargs["window_iters"] = window_iters
+        kwargs["record_history"] = record_history
         kwargs["time_limit_seconds"] = time_limit_seconds
         kwargs["run_info"] = run_info
         kwargs["init"] = init
@@ -1005,6 +1105,7 @@ class MDSTorusProjector(TorusProjector):
         self.sgd_elapsed_seconds_ = run_info.get("elapsed_seconds")
         self.n_iter_ = run_info.get("iterations")
         self.termination_reason_ = run_info.get("termination_reason")
+        self.stress_history_ = run_info.get("stress_history")
         final_info = {
             "mode": None,
             "time_limit_reached": self.time_limit_reached_,
