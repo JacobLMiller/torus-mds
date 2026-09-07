@@ -27,7 +27,7 @@ TORUS_MAX_ITERS="${TORUS_MAX_ITERS:-10000}"
 WRAP_PYTHON_MAX_N="${WRAP_PYTHON_MAX_N:-3500}"
 SEED_BASE="${SEED_BASE:-0}"
 STRESS_MODE="${STRESS_MODE:-normalized}"
-METHODS="${METHODS:-TorusMDS s_gd2 wrap_python}"
+METHODS="${METHODS:-TorusMDS_smart_1x_scale2 TorusMDS_random_1x_scale2 s_gd2 wrap_python}"
 
 # Runs that deviate from the (raw, 10000-iter) default land in a
 # distinctly-named subdir under LAYOUTS_ROOT (default "layouts") so they
