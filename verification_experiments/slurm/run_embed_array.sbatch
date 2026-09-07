@@ -23,13 +23,13 @@ conda activate torus-mds
 FAMILY="${FAMILY:?Set FAMILY=sbm|grg|suitesparse via --export}"
 SHARD="${SLURM_ARRAY_TASK_ID}"
 LAYOUTS_ROOT="${LAYOUTS_ROOT:-layouts}"
-TORUS_MAX_ITERS="${TORUS_MAX_ITERS:-2000}"
+TORUS_MAX_ITERS="${TORUS_MAX_ITERS:-10000}"
 WRAP_PYTHON_MAX_N="${WRAP_PYTHON_MAX_N:-3500}"
 SEED_BASE="${SEED_BASE:-0}"
-STRESS_MODE="${STRESS_MODE:-raw}"
+STRESS_MODE="${STRESS_MODE:-normalized}"
 METHODS="${METHODS:-TorusMDS s_gd2 wrap_python}"
 
-# Runs that deviate from the (raw, 2000-iter) default land in a
+# Runs that deviate from the (raw, 10000-iter) default land in a
 # distinctly-named subdir under LAYOUTS_ROOT (default "layouts") so they
 # don't collide with -- or get skipped as already-done against -- manifests
 # from a different configuration on the same graphs (e.g. a normalized-stress
@@ -40,7 +40,7 @@ FAMILY_SUBDIR="$FAMILY"
 if [ "$STRESS_MODE" != "raw" ]; then
   FAMILY_SUBDIR="${FAMILY_SUBDIR}_${STRESS_MODE}"
 fi
-if [ "$TORUS_MAX_ITERS" != "2000" ]; then
+if [ "$TORUS_MAX_ITERS" != "10000" ]; then
   FAMILY_SUBDIR="${FAMILY_SUBDIR}_iters${TORUS_MAX_ITERS}"
 fi
 
@@ -88,7 +88,7 @@ case "$FAMILY" in
         --output-dir "${LAYOUTS_ROOT}/${FAMILY_SUBDIR}/${N_MIN}_${N_MAX}/shard_${SHARD}"
     else
       GRAPHS_PER_SHARD="${GRAPHS_PER_SHARD:?Set GRAPHS_PER_SHARD via --export}"
-      GRAPH_TYPE_WEIGHTS="${GRAPH_TYPE_WEIGHTS:-1,1,1}"
+      GRAPH_TYPE_WEIGHTS="${GRAPH_TYPE_WEIGHTS:-1,1}"
       python verification_experiments/grg_comparison.py \
         --n-graphs "$GRAPHS_PER_SHARD" \
         --n-min "$N_MIN" --n-max "$N_MAX" \

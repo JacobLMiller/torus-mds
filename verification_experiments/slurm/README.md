@@ -178,19 +178,19 @@ Restrict via `--export=ALL,...,METHODS="TorusMDS s_gd2"` (space-separated,
 matches `run_embeddings`'s `methods=` choices) to skip `wrap_python` --
 useful since it's the slowest method by far and the one most often excluded
 from a quick comparison. For `FAMILY=grg`, `GRAPH_TYPE_WEIGHTS` (default
-`1,1,1`, i.e. euclidean/toroidal/spherical in equal thirds) selects the mix
-of GRG variants generated; `GRAPH_TYPE_WEIGHTS="0,1,0"` generates toroidal
-GRGs only. **Because its value itself contains commas, it can't go inside a
+`1,1`, i.e. euclidean/toroidal in equal halves) selects the mix of GRG
+variants generated; `GRAPH_TYPE_WEIGHTS="0,1"` generates toroidal GRGs
+only. **Because its value itself contains a comma, it can't go inside a
 `--export=ALL,KEY=val,KEY=val` list** -- `sbatch --export` splits on every
 comma in the whole argument, including ones inside a value, since the
 shell's quotes are already gone by the time SLURM parses it (a value like
-`"0,1,0"` silently becomes `GRAPH_TYPE_WEIGHTS=0` plus two bogus `1`/`0`
-entries, and `grg_comparison.py` then rejects it: `--graph-type-weights
-must have exactly 3 comma-separated values`). Export it as a shell variable
-instead and let plain `--export=ALL` forward it:
+`"0,1"` silently becomes `GRAPH_TYPE_WEIGHTS=0` plus a bogus `1` entry, and
+`grg_comparison.py` then rejects it: `--graph-type-weights must have
+exactly 2 comma-separated values`). Export it as a shell variable instead
+and let plain `--export=ALL` forward it:
 
 ```bash
-export GRAPH_TYPE_WEIGHTS="0,1,0"
+export GRAPH_TYPE_WEIGHTS="0,1"
 sbatch --array=0-3 --time=05:00:00 --mem=4G \
     --export=ALL,FAMILY=grg,N_MIN=100,N_MAX=5000,GRAPHS_PER_SHARD=625,METHODS="TorusMDS s_gd2" \
     verification_experiments/slurm/run_embed_array.sbatch
@@ -255,10 +255,12 @@ graph at the top tier. Smoke-test the top tier first
 that shard's `runs.csv`, and size the full submission's `--time` from that --
 exactly as section 1 already recommends for its own tiers.
 
-GRG here is restricted to Euclidean + toroidal only (no spherical):
-`GRAPH_TYPE_WEIGHTS="1,1,0"`. As with section 1's GRG example, export it as a
-shell variable rather than putting it inside `--export=ALL,...` (its commas
-would otherwise be split by `sbatch --export` itself).
+GRG only ever generates Euclidean and toroidal graphs (there's no spherical
+variant), so nothing special is needed here to exclude it. If you want an
+uneven mix between the two, `GRAPH_TYPE_WEIGHTS` still works the same way as
+section 1's GRG example -- export it as a shell variable rather than putting
+it inside `--export=ALL,...` (its comma would otherwise be split by `sbatch
+--export` itself).
 
 **Core budget.** Each array task requests `--cpus-per-task=2` (the repo's
 existing convention -- one core for the numba-jitted SGD/BFS loop, one of
@@ -295,8 +297,7 @@ mkdir -p slurm_logs
 export METHODS="TorusMDS_smart_1x TorusMDS_smart_100x TorusMDS_random_1x TorusMDS_random_100x s_gd2 wrap_python"
 export STRESS_MODE=normalized
 
-# --- GRG (Euclidean + toroidal only), 3 tiers serialized via singleton ---
-export GRAPH_TYPE_WEIGHTS="1,1,0"
+# --- GRG (Euclidean + toroidal), 3 tiers serialized via singleton ---
 sbatch --job-name=torus-embed-grg --dependency=singleton --array=0-2 --time=00:30:00 --mem=2G \
     --export=ALL,FAMILY=grg,N_MIN=100,N_MAX=1000,GRAPHS_PER_SHARD=150 \
     verification_experiments/slurm/run_embed_array.sbatch
@@ -306,7 +307,6 @@ sbatch --job-name=torus-embed-grg --dependency=singleton --array=0-2 --time=02:0
 sbatch --job-name=torus-embed-grg --dependency=singleton --array=0-2 --time=05:00:00 --mem=8G \
     --export=ALL,FAMILY=grg,N_MIN=3000,N_MAX=10000,GRAPHS_PER_SHARD=20 \
     verification_experiments/slurm/run_embed_array.sbatch
-unset GRAPH_TYPE_WEIGHTS
 
 # --- SBM, 3 tiers serialized via singleton (own job-name -> runs
 #     alongside the GRG chain above, not queued behind it) ---

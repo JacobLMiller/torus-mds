@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Pregenerates GRG graphs (euclidean/toroidal/spherical) and caches them as
-lightweight sparse-adjacency .npz files (same format stage_suitesparse.py
-uses for its cache): one graph_<exp_idx>.npz per graph plus a manifest.csv,
-under --output-dir.
+Pregenerates GRG graphs (euclidean/toroidal) and caches them as lightweight
+sparse-adjacency .npz files (same format stage_suitesparse.py uses for its
+cache): one graph_<exp_idx>.npz per graph plus a manifest.csv, under
+--output-dir.
 
 Run this once per (n_min, n_max) size tier. Point grg_comparison.py
 --cache-dir at the resulting directory (with --shard-index/--num-shards
@@ -17,7 +17,7 @@ rather than regenerating already-staged graphs.
 Usage:
     python stage_grg.py --n-graphs 450 --n-min 100 --n-max 1000 \
         --output-dir data/grg_cache/100_1000
-    python stage_grg.py --graph-type-weights 1,1,0 ...   # no spherical
+    python stage_grg.py --graph-type-weights 0.6,0.4 ...
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def stage_grg(
     eps_min: float,
     eps_max: float,
     n_eps: int,
-    graph_type_weights: tuple[float, float, float],
+    graph_type_weights: tuple[float, float],
     seed: int,
     output_dir: str,
     checkpoint_every: int = 50,
@@ -96,15 +96,15 @@ if __name__ == "__main__":
                         help="Minimum number of nodes (default: 100)")
     parser.add_argument("--n-max", type=int, default=10000,
                         help="Maximum number of nodes (default: 10000)")
-    parser.add_argument("--eps-min", type=float, default=0.10,
+    parser.add_argument("--eps-min", type=float, default=0.05,
                         help="Minimum connection radius epsilon (default: 0.10)")
-    parser.add_argument("--eps-max", type=float, default=0.40,
+    parser.add_argument("--eps-max", type=float, default=0.20,
                         help="Maximum connection radius epsilon (default: 0.40)")
     parser.add_argument("--n-eps", type=int, default=6,
                         help="Number of discrete epsilon values in grid (default: 6)")
-    parser.add_argument("--graph-type-weights", type=str, default="1,1,1",
-                        help="Comma-separated euclidean,toroidal,spherical sampling weights "
-                             "(default: 1,1,1 = equal thirds)")
+    parser.add_argument("--graph-type-weights", type=str, default="1,1",
+                        help="Comma-separated euclidean,toroidal sampling weights "
+                             "(default: 1,1 = equal halves)")
     parser.add_argument("--output-dir", type=str, default="data/grg_cache",
                         help="Local cache directory (default: data/grg_cache)")
     parser.add_argument("--checkpoint-every", type=int, default=50,
@@ -114,8 +114,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     weights = np.array([float(w) for w in args.graph_type_weights.split(",")], dtype=float)
-    if weights.shape != (3,):
-        parser.error("--graph-type-weights must have exactly 3 comma-separated values")
+    if weights.shape != (2,):
+        parser.error("--graph-type-weights must have exactly 2 comma-separated values")
     weights = weights / weights.sum()
 
     stage_grg(

@@ -15,11 +15,11 @@
 #   sbatch --export=ALL,N_MIN=100,N_MAX=1000,N_GRAPHS=450 \
 #       verification_experiments/slurm/stage_grg.sbatch
 #
-# GRAPH_TYPE_WEIGHTS contains commas, so (as with run_embed_array.sbatch)
-# export it as a shell variable first rather than putting it inside
-# --export=ALL,KEY=val,... -- sbatch --export splits on every comma in the
-# whole argument:
-#   export GRAPH_TYPE_WEIGHTS="1,1,0"
+# GRAPH_TYPE_WEIGHTS (comma-separated euclidean,toroidal weights) contains
+# commas, so (as with run_embed_array.sbatch) export it as a shell variable
+# first rather than putting it inside --export=ALL,KEY=val,... -- sbatch
+# --export splits on every comma in the whole argument:
+#   export GRAPH_TYPE_WEIGHTS="0.6,0.4"
 #   sbatch --export=ALL,N_MIN=100,N_MAX=1000,N_GRAPHS=450 \
 #       verification_experiments/slurm/stage_grg.sbatch
 #
@@ -46,7 +46,7 @@ N_GRAPHS="${N_GRAPHS:?Set N_GRAPHS via --export}"
 python verification_experiments/stage_grg.py \
     --n-graphs "$N_GRAPHS" \
     --n-min "$N_MIN" --n-max "$N_MAX" \
-    --eps-min "${EPS_MIN:-0.10}" --eps-max "${EPS_MAX:-0.40}" --n-eps "${N_EPS:-6}" \
-    --graph-type-weights "${GRAPH_TYPE_WEIGHTS:-1,1,1}" \
+    --eps-min "${EPS_MIN:-0.05}" --eps-max "${EPS_MAX:-0.20}" --n-eps "${N_EPS:-100}" \
+    --graph-type-weights "${GRAPH_TYPE_WEIGHTS:-1,1}" \
     --seed "${SEED:-0}" \
     --output-dir "${OUTPUT_DIR:-data/grg_cache/${N_MIN}_${N_MAX}}"
