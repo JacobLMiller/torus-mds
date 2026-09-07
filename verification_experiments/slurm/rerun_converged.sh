@@ -33,6 +33,7 @@ conda activate torus-mds
 
 OLD_LAYOUTS_ROOT="${OLD_LAYOUTS_ROOT:-layouts}"
 NEW_LAYOUTS_ROOT="${NEW_LAYOUTS_ROOT:-layouts_converged}"
+NEW_DRAWINGS_ROOT="${NEW_DRAWINGS_ROOT:-layout_drawings_converged}"
 SBM_CACHE_ROOT="${SBM_CACHE_ROOT:-data/sbm_cache}"
 GRG_CACHE_ROOT="${GRG_CACHE_ROOT:-data/grg_cache}"
 SUITESPARSE_CACHE_DIR="${SUITESPARSE_CACHE_DIR:-data/suitesparse_cache}"
@@ -142,8 +143,32 @@ if copy_and_strip "$src" "$dst"; then
     echo "  submitted metrics job $metrics_job (after $embed_job, $n_shards shards)"
 fi
 
+# ============================= Drawings =========================
+# draw_layouts_array.sbatch globs every runs.csv under the given LAYOUTS_ROOT
+# in one combined, sorted list (it isn't scoped per-family), so this is
+# submitted once against the whole NEW_LAYOUTS_ROOT tree, gated on ALL embed
+# jobs above (sbm + grg + suitesparse, whichever ran) rather than per family.
+echo "=== Drawings ==="
+embed_jobs=()
+[ -n "$last_sbm_job" ] && embed_jobs+=("$last_sbm_job")
+[ -n "$last_grg_job" ] && embed_jobs+=("$last_grg_job")
+[ -n "${embed_job:-}" ] && embed_jobs+=("$embed_job")
+
+if [ "${#embed_jobs[@]}" -gt 0 ]; then
+    dep="afterok:$(IFS=:; echo "${embed_jobs[*]}")"
+    n_total=$(count_shards "$NEW_LAYOUTS_ROOT")
+    # %2 throttles the array so at most 2 draw tasks run concurrently.
+    draw_job=$(sbatch --parsable --dependency="$dep" --array=0-$((n_total - 1))%2 \
+        --export=ALL,LAYOUTS_ROOT="$NEW_LAYOUTS_ROOT",OUTPUT_ROOT="$NEW_DRAWINGS_ROOT" \
+        verification_experiments/slurm/draw_layouts_array.sbatch)
+    echo "  submitted draw job $draw_job (after ${embed_jobs[*]}, $n_total shards, throttled to 2 at a time)"
+else
+    echo "  (skip -- no embed jobs were submitted)"
+fi
+
 echo
 echo "Done. Track with: squeue -u \$USER"
 echo "Once all metrics jobs finish, merge as usual (see slurm/README.md step 3),"
 echo "globbing results/<family>_normalized_*_comparison.csv as before -- these"
 echo "still land in results/, unaffected by LAYOUTS_ROOT."
+echo "Drawings land under ${NEW_DRAWINGS_ROOT}/ once the draw job finishes."

@@ -1,0 +1,13 @@
+name: torus-mds
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy<2          # s_gd2's compiled extension is built against NumPy 1.x
+  - networkx
+  - pandas
+  - scipy
+  - numba
+  - tqdm
+  - s_gd2
+  - ssgetpy
