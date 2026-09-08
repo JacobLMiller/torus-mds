@@ -10,11 +10,13 @@ from .metrics import geodesic_matrix, subsample
 
 
 def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
-                                   s=10, node_alpha=0.9,
-                                   edge_alpha=0.10, edge_lw=0.4,
+                                   s=None, node_alpha=0.9,
+                                   edge_alpha=None, edge_lw=0.4,
                                    colors=None, cmap=None, vmin=None, vmax=None,
                                    order=None,
                                    torus=None,
+                                   tsnet_style=False,
+                                   show_ticks=True,
                                    ax=None):
     """
     Scatter + edges drawn along shortest torus geodesics, displayed in physical space.
@@ -23,6 +25,11 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
     G:     networkx graph
     torus: optional projector object. Reads torus_embedding_, alpha_, r0_, r1_, theta_
            to recover the physical geometry. theta_ defaults to pi/2 (rectangular).
+    tsnet_style: if True, draw tsNET-like: edges colored by their (geodesic) physical
+           length via the "jet_r" colormap, and very small black vertices. Overrides
+           colors/cmap/vmin/vmax for the nodes.
+    show_ticks: if False, omit the physical-unit tick marks/labels on the parallelogram
+           edges (the parallelogram boundary itself is still drawn).
 
     Physical lattice vectors (columns of M):
       e1 = (alpha*r0, 0)
@@ -30,6 +37,8 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
     All coordinates are mapped through M before plotting. Normal axes are hidden;
     tick marks with physical-unit labels are drawn directly on the parallelogram edges.
     """
+    s = s if s is not None else (0 if tsnet_style else 3)
+    edge_alpha = edge_alpha if edge_alpha is not None else (0.8 if tsnet_style else 0.10)
     # Resolve embedding
     if X is None:
         if torus is None or torus.torus_embedding_ is None:
@@ -76,7 +85,15 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
                 cross[dn, kk] = np.clip(((0.0 - p[:, kk]) / d[:, kk])[dn], 0.0, 1.0)
         cross.sort(axis=1)
         bp = np.concatenate([np.zeros((E, 1)), cross, np.ones((E, 1))], axis=1)  # breakpoints
-        segs = []
+
+        if tsnet_style:
+            edge_lengths = np.linalg.norm(d @ M.T, axis=1)   # per-edge physical (geodesic) length
+            span = edge_lengths.max() - edge_lengths.min()
+            norm_len = (edge_lengths - edge_lengths.min()) / span if span > 0 else np.zeros_like(edge_lengths)
+            edge_colors = plt.get_cmap("jet_r")(norm_len)
+            edge_colors[:, 3] = edge_alpha
+
+        segs, seg_colors, seg_lengths = [], [], []
         for a_t, b_t in ((0, 1), (1, 2), (2, 3)):
             t0, t1 = bp[:, a_t], bp[:, b_t]
             keep = (t1 - t0) > 1e-9              # drop degenerate pieces
@@ -88,16 +105,30 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
             a = np.clip(a - tile, 0.0, 1.0) @ M.T
             b = np.clip(b - tile, 0.0, 1.0) @ M.T
             segs.append(np.stack([a, b], axis=1))
+            if tsnet_style:
+                seg_colors.append(edge_colors[keep])
+                seg_lengths.append(edge_lengths[keep])
         if segs:
-            ax.add_collection(LineCollection(np.concatenate(segs, axis=0), colors="k",
-                                             alpha=edge_alpha, linewidths=edge_lw, zorder=1))
+            if tsnet_style:
+                all_segs = np.concatenate(segs, axis=0)
+                all_colors = np.concatenate(seg_colors, axis=0)
+                all_lengths = np.concatenate(seg_lengths, axis=0)
+                draw_order = np.argsort(all_lengths)[::-1]   # long to short: short edges drawn last, on top
+                ax.add_collection(LineCollection(all_segs[draw_order], colors=all_colors[draw_order],
+                                                 linewidths=edge_lw, zorder=1))
+            else:
+                ax.add_collection(LineCollection(np.concatenate(segs, axis=0), colors="k",
+                                                 alpha=edge_alpha, linewidths=edge_lw, zorder=1))
 
     # points. Pass scalar `colors` with a `cmap` (not pre-mapped RGBA) so the
     # returned PathCollection is a proper ScalarMappable and plt.colorbar works.
     X_phys = X @ M.T
-    ax.scatter(X_phys[:, 0], X_phys[:, 1], s=s, alpha=node_alpha, zorder=2,
-               c=colors if colors is not None else "blue",
-               cmap=cmap, vmin=vmin, vmax=vmax)
+    if tsnet_style:
+        ax.scatter(X_phys[:, 0], X_phys[:, 1], s=s, alpha=node_alpha, zorder=2, c="black")
+    else:
+        ax.scatter(X_phys[:, 0], X_phys[:, 1], s=s, alpha=node_alpha, zorder=2,
+                   c=colors if colors is not None else "blue",
+                   cmap=cmap, vmin=vmin, vmax=vmax)
 
     # parallelogram boundary of the fundamental domain
     corners = np.array([[0, 0], [1, 0], [1, 1], [0, 1]]) @ M.T
@@ -106,71 +137,94 @@ def plot_embedding_with_torus_edges(X=None, G=None, outpath="output.png",
 
     ax.set_aspect('equal', adjustable='box')
     ax.axis('off')
-    # --- Tick marks with physical-unit labels on parallelogram edges ---
-    n_ticks   = 5
-    tick_ts   = np.linspace(0, 1, n_ticks)
-    tick_size = 0.025 * max(r0, r1)   # tick length in physical units
-    pad       = 0.03  * max(r0, r1)   # gap between tick tip and label
 
-    e1_perp = np.array([0.0, -1.0])                      # outward normal to bottom side
-    e2_end  = M @ np.array([0.0, 1.0])                   # physical tip of e2
-    e2_perp = np.array([-np.sin(theta), np.cos(theta)])  # outward normal to left side
+    if show_ticks:
+        # --- Tick marks with physical-unit labels on parallelogram edges ---
+        n_ticks   = 5
+        tick_ts   = np.linspace(0, 1, n_ticks)
+        tick_size = 0.025 * max(r0, r1)   # tick length in physical units
+        pad       = 0.03  * max(r0, r1)   # gap between tick tip and label
 
-    # Bottom side (e1): 5 ticks with labels showing physical distance from 0 to r0
-    for t in tick_ts:
-        pt = np.array([t * r0, 0.0])
-        tip = pt + tick_size * e1_perp
-        ax.plot([pt[0], tip[0]], [pt[1], tip[1]], color='dimgray', lw=0.8, zorder=4)
-        lbl_pos = tip + pad * e1_perp
-        ax.text(lbl_pos[0], lbl_pos[1], f"{t * r0:.3g}",
-                ha='center', va='top', fontsize=8, color='dimgray')
+        e1_perp = np.array([0.0, -1.0])                      # outward normal to bottom side
+        e2_end  = M @ np.array([0.0, 1.0])                   # physical tip of e2
+        e2_perp = np.array([-np.sin(theta), np.cos(theta)])  # outward normal to left side
 
-    # Left side (e2): 5 ticks with labels showing physical distance from 0 to r1.
-    # Skip the t=0 label — already covered by the "0" on the bottom side.
-    for t in tick_ts:
-        pt = t * e2_end
-        tip = pt + tick_size * e2_perp
-        ax.plot([pt[0], tip[0]], [pt[1], tip[1]], color='dimgray', lw=0.8, zorder=4)
-        if t > 0:
-            lbl_pos = tip + pad * e2_perp
-            ax.text(lbl_pos[0], lbl_pos[1], f"{t * r1:.3g}",
-                    ha='center', va='center', rotation=np.degrees(theta),
-                    fontsize=8, color='dimgray')
+        # Bottom side (e1): 5 ticks with labels showing physical distance from 0 to r0
+        for t in tick_ts:
+            pt = np.array([t * r0, 0.0])
+            tip = pt + tick_size * e1_perp
+            ax.plot([pt[0], tip[0]], [pt[1], tip[1]], color='dimgray', lw=0.8, zorder=4)
+            lbl_pos = tip + pad * e1_perp
+            ax.text(lbl_pos[0], lbl_pos[1], f"{t * r0:.3g}",
+                    ha='center', va='top', fontsize=8, color='dimgray')
+
+        # Left side (e2): 5 ticks with labels showing physical distance from 0 to r1.
+        # Skip the t=0 label — already covered by the "0" on the bottom side.
+        for t in tick_ts:
+            pt = t * e2_end
+            tip = pt + tick_size * e2_perp
+            ax.plot([pt[0], tip[0]], [pt[1], tip[1]], color='dimgray', lw=0.8, zorder=4)
+            if t > 0:
+                lbl_pos = tip + pad * e2_perp
+                ax.text(lbl_pos[0], lbl_pos[1], f"{t * r1:.3g}",
+                        ha='center', va='center', rotation=np.degrees(theta),
+                        fontsize=8, color='dimgray')
     return ax
 
 
 def plot_embedding(
     X,
     G,
-    s=10,
+    s=None,
     node_alpha=0.9,
-    edge_alpha=0.10,
+    edge_alpha=None,
     edge_lw=0.4,
     colors=None,
+    tsnet_style=False,
     ax=None,
 ):
     """
     Scatter plot of an embedding with straight edges (no torus wrapping).
 
-    X : (N, 2) embedding — wrapped to [0,1]^2 for display.
+    X : (N, 2) embedding, plotted as-is (no periodic wrapping).
     G : networkx graph whose node order matches rows of X.
+    tsnet_style: if True, draw tsNET-like: edges colored by their (straight-line)
+           length via the "jet_r" colormap, and very small black vertices.
+           Overrides `colors` for the nodes.
     """
-    X = np.asarray(X, dtype=np.float64) % 1.0
+    s = s if s is not None else 3
+    if tsnet_style: s = 0
+    edge_alpha = edge_alpha if edge_alpha is not None else (0.8 if tsnet_style else 0.10)
+    X = np.asarray(X, dtype=np.float64)
     idx = {n: i for i, n in enumerate(G.nodes())}
 
     if ax is None:
         _, ax = plt.subplots()
 
-    for u, v in G.edges():
-        i, j = idx[u], idx[v]
-        p, q = X[i], X[j]
-        ax.plot([p[0], q[0]], [p[1], q[1]],
-                color="k", alpha=edge_alpha, lw=edge_lw, zorder=1)
+    if G.number_of_edges() > 0:
+        ij = np.array([(idx[u], idx[v]) for u, v in G.edges()])
+        p, q = X[ij[:, 0]], X[ij[:, 1]]
+        segs = np.stack([p, q], axis=1)
+        if tsnet_style:
+            edge_lengths = np.linalg.norm(q - p, axis=1)
+            span = edge_lengths.max() - edge_lengths.min()
+            norm_len = (edge_lengths - edge_lengths.min()) / span if span > 0 else np.zeros_like(edge_lengths)
+            edge_colors = plt.get_cmap("jet_r")(norm_len)
+            edge_colors[:, 3] = edge_alpha
+            draw_order = np.argsort(edge_lengths)[::-1]   # long to short: short edges drawn last, on top
+            ax.add_collection(LineCollection(segs[draw_order], colors=edge_colors[draw_order],
+                                             linewidths=edge_lw, zorder=1))
+        else:
+            ax.add_collection(LineCollection(segs, colors="k", alpha=edge_alpha,
+                                             linewidths=edge_lw, zorder=1))
 
-    ax.scatter(X[:, 0], X[:, 1], s=s, alpha=node_alpha, zorder=2,
-               c=colors if colors is not None else "blue")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    if tsnet_style:
+        ax.scatter(X[:, 0], X[:, 1], s=s, alpha=node_alpha, zorder=2, c="black")
+    else:
+        ax.scatter(X[:, 0], X[:, 1], s=s, alpha=node_alpha, zorder=2,
+                   c=colors if colors is not None else "blue")
+    ax.autoscale_view()
+    ax.axis('off')
     plt.tight_layout()
     return ax
 

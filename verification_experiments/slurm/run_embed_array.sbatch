@@ -43,6 +43,17 @@ fi
 if [ "$TORUS_MAX_ITERS" != "10000" ]; then
   FAMILY_SUBDIR="${FAMILY_SUBDIR}_iters${TORUS_MAX_ITERS}"
 fi
+# suitesparse's N_MIN/N_MAX (unlike sbm/grg's) filter the staged manifest
+# rather than selecting a pre-partitioned generation tier, which reassigns
+# exp_idx over the filtered pool. Reusing the plain shard_<i>/ dirs under
+# that filtering would silently desync graph_<exp_idx>.npz / runs.csv from
+# the new mapping (stale graph file kept since it already exists, and a
+# manifest row for a since-remapped exp_idx wrongly read as "already done"
+# for the new graph at that index) -- so fold them into FAMILY_SUBDIR here,
+# same as the STRESS_MODE/TORUS_MAX_ITERS suffixes above.
+if [ "$FAMILY" = "suitesparse" ] && { [ -n "${N_MIN:-}" ] || [ -n "${N_MAX:-}" ]; }; then
+  FAMILY_SUBDIR="${FAMILY_SUBDIR}_n${N_MIN:-0}to${N_MAX:-max}"
+fi
 
 case "$FAMILY" in
   sbm)
@@ -103,9 +114,18 @@ case "$FAMILY" in
     ;;
   suitesparse)
     NUM_SHARDS="${NUM_SHARDS:?Set NUM_SHARDS via --export (must match --array size)}"
+    # N_MIN/N_MAX are optional here (unlike sbm/grg, where they pick a
+    # generation tier) -- they filter the already-staged manifest by its 'n'
+    # column. Filtering changes which matrix each exp_idx maps to, so pass a
+    # fresh --output-dir (LAYOUTS_ROOT and/or FAMILY_SUBDIR) whenever these
+    # are set, rather than reusing a directory built without them.
+    N_MIN_ARGS=()
+    [ -n "${N_MIN:-}" ] && N_MIN_ARGS+=(--n-min "$N_MIN")
+    [ -n "${N_MAX:-}" ] && N_MIN_ARGS+=(--n-max "$N_MAX")
     python verification_experiments/suitesparse_comparison.py \
       --cache-dir "${SUITESPARSE_CACHE_DIR:-data/suitesparse_cache}" \
       --shard-index "$SHARD" --num-shards "$NUM_SHARDS" \
+      "${N_MIN_ARGS[@]}" \
       --torus-max-iters "$TORUS_MAX_ITERS" \
       --wrap-python-max-n "$WRAP_PYTHON_MAX_N" \
       --stress-mode "$STRESS_MODE" \

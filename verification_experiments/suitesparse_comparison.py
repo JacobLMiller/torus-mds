@@ -25,12 +25,20 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules.experiment_runner import (
-    ASPECT_INIT_VARIANTS, METHODS, SPECTRAL_INIT_ONLY_METHOD, GraphRecord, load_graph, run_embeddings,
+    ASPECT_INIT_VARIANTS, METHODS, PARALLELOGRAM_METHOD, SPECTRAL_INIT_ONLY_METHOD,
+    GraphRecord, load_graph, run_embeddings,
 )
 
 
-def suitesparse_graph_iterator(cache_dir: str, shard_index: int, num_shards: int):
+def suitesparse_graph_iterator(
+    cache_dir: str, shard_index: int, num_shards: int,
+    n_min: int | None = None, n_max: int | None = None,
+):
     manifest = pd.read_csv(os.path.join(cache_dir, "manifest.csv"))
+    if n_min is not None:
+        manifest = manifest[manifest["n"] >= n_min]
+    if n_max is not None:
+        manifest = manifest[manifest["n"] <= n_max]
     manifest = manifest.sort_values("matrix_id").reset_index(drop=True)
 
     for exp_idx, row in manifest.iterrows():
@@ -60,15 +68,23 @@ if __name__ == "__main__":
                         help="This shard's index in [0, num_shards) for SLURM array parallelism (default: 0)")
     parser.add_argument("--num-shards", type=int, default=1,
                         help="Total number of shards (default: 1, i.e. no sharding)")
+    parser.add_argument("--n-min", type=int, default=None,
+                        help="Only embed graphs with at least this many vertices, per the "
+                             "staged manifest's 'n' column (default: no lower bound)")
+    parser.add_argument("--n-max", type=int, default=None,
+                        help="Only embed graphs with at most this many vertices, per the "
+                             "staged manifest's 'n' column (default: no upper bound). Filtering "
+                             "reassigns exp_idx over the filtered pool, so use a fresh --output-dir "
+                             "rather than reusing one built with a different --n-min/--n-max.")
     parser.add_argument("--torus-max-iters", type=int, default=10000,
                         help="SGD iterations for TorusMDS (default: 10000)")
     parser.add_argument("--stress-mode", type=str, default="raw", choices=["raw", "normalized"],
                         help="TorusMDS training objective: 'raw' minimizes sum((alpha*r-d)^2), "
                              "'normalized' minimizes sum((alpha*r-d)^2 / d^2) (default: raw)")
     parser.add_argument("--methods", type=str, nargs="+", default=list(METHODS),
-                        choices=list(METHODS) + list(ASPECT_INIT_VARIANTS) + [SPECTRAL_INIT_ONLY_METHOD],
+                        choices=list(METHODS) + list(ASPECT_INIT_VARIANTS) + [SPECTRAL_INIT_ONLY_METHOD, PARALLELOGRAM_METHOD],
                         help=f"Which methods to run, space-separated (default: all of {list(METHODS)}; "
-                             f"also available: {list(ASPECT_INIT_VARIANTS)})")
+                             f"also available: {list(ASPECT_INIT_VARIANTS)}, {PARALLELOGRAM_METHOD})")
     parser.add_argument("--wrap-python-max-iters", type=int, default=200,
                         help="Descent iterations for wrap_python -- kept low since its cost is "
                              "O(n^2 * iters); 200 matches the Chen reference's own default (default: 200)")
@@ -89,6 +105,8 @@ if __name__ == "__main__":
         cache_dir=args.cache_dir,
         shard_index=args.shard_index,
         num_shards=args.num_shards,
+        n_min=args.n_min,
+        n_max=args.n_max,
     )
 
     run_embeddings(
