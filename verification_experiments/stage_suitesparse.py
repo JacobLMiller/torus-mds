@@ -62,6 +62,7 @@ def stage_suitesparse(
     n_max: int,
     output_dir: str,
     prefilter_limit: int = 20000,
+    sort_by: str = "nnz",
 ) -> pd.DataFrame:
     os.makedirs(output_dir, exist_ok=True)
     manifest_path = os.path.join(output_dir, "manifest.csv")
@@ -82,7 +83,11 @@ def stage_suitesparse(
     print("Querying SuiteSparse Matrix Collection index...")
     candidates = ssgetpy.search(rowbounds=(n_min, n_max), colbounds=(n_min, n_max), limit=prefilter_limit)
     candidates = [m for m in candidates if m.rows == m.cols and m.id not in already]
-    candidates.sort(key=lambda m: m.nnz)
+    # ``rows`` is the Matrix Collection's vertex count before extracting the
+    # largest connected component.  Sorting it first is the useful definition
+    # of "smallest graph" at collection-query time; the final LCC-size filter
+    # below still guarantees every persisted graph is in the requested range.
+    candidates.sort(key=(lambda m: m.rows) if sort_by == "vertices" else (lambda m: m.nnz))
     print(f"{len(candidates)} square candidate matrices in range after prefilter.")
 
     tmp = tempfile.mkdtemp(prefix="suitesparse_stage_")
@@ -141,6 +146,8 @@ if __name__ == "__main__":
                         help="Local cache directory (default: data/suitesparse_cache)")
     parser.add_argument("--prefilter-limit", type=int, default=20000,
                         help="Max candidates to query from the SuiteSparse index before downloading (default: 20000)")
+    parser.add_argument("--sort-by", choices=["nnz", "vertices"], default="nnz",
+                        help="Candidate priority: nonzeros (default) or fewest matrix vertices")
     args = parser.parse_args()
 
     stage_suitesparse(
@@ -149,4 +156,5 @@ if __name__ == "__main__":
         n_max=args.n_max,
         output_dir=args.output_dir,
         prefilter_limit=args.prefilter_limit,
+        sort_by=args.sort_by,
     )

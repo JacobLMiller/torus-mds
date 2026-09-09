@@ -22,19 +22,20 @@ import glob as _glob
 import pandas as pd
 
 
-def merge_results(shard_csvs: list[str], output_csv: str) -> pd.DataFrame:
+def merge_results(shard_csvs: list[str], output_csv: str, preserve_exp_idx: bool = False) -> pd.DataFrame:
     frames = []
     next_exp_idx = 0
     for path in shard_csvs:
         df = pd.read_csv(path)
         if df.empty:
             continue
-        old_ids = sorted(df["exp_idx"].unique())
-        old_to_new = {old: next_exp_idx + i for i, old in enumerate(old_ids)}
         df = df.copy()
-        df["exp_idx"] = df["exp_idx"].map(old_to_new)
+        if not preserve_exp_idx:
+            old_ids = sorted(df["exp_idx"].unique())
+            old_to_new = {old: next_exp_idx + i for i, old in enumerate(old_ids)}
+            df["exp_idx"] = df["exp_idx"].map(old_to_new)
+            next_exp_idx += len(old_ids)
         df["source_shard"] = path
-        next_exp_idx += len(old_ids)
         frames.append(df)
 
     merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -51,6 +52,8 @@ if __name__ == "__main__":
                         help="Explicit list of per-shard result CSV paths (alternative to --glob)")
     parser.add_argument("--output", type=str, required=True,
                         help="Merged output CSV path")
+    parser.add_argument("--preserve-exp-idx", action="store_true",
+                        help="Keep exp_idx unchanged; use when files contain different methods on the same graphs")
     args = parser.parse_args()
 
     if args.glob:
@@ -63,4 +66,4 @@ if __name__ == "__main__":
     if not paths:
         parser.error("No shard CSVs matched")
 
-    merge_results(paths, args.output)
+    merge_results(paths, args.output, preserve_exp_idx=args.preserve_exp_idx)
