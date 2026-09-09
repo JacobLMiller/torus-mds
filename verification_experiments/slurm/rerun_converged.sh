@@ -14,6 +14,10 @@
 #      already-staged --cache-dir pools (no regeneration).
 #   4. Submits the metrics job with --dependency=afterok on the embed job(s),
 #      so it starts automatically once they finish -- no need to babysit squeue.
+#      Output CSVs land under NEW_RESULTS_ROOT (default results_converged/),
+#      kept separate from results/ so they can't collide with -- and get
+#      silently skipped against, via compute_metrics.py's resume checkpoint --
+#      the original run's CSVs of the same shard names.
 #
 # Submit from the repo root:
 #   bash verification_experiments/slurm/rerun_converged.sh
@@ -34,6 +38,13 @@ conda activate torus-mds
 OLD_LAYOUTS_ROOT="${OLD_LAYOUTS_ROOT:-layouts}"
 NEW_LAYOUTS_ROOT="${NEW_LAYOUTS_ROOT:-layouts_converged}"
 NEW_DRAWINGS_ROOT="${NEW_DRAWINGS_ROOT:-layout_drawings_converged}"
+# run_metrics_array.sbatch names its output CSV from FAMILY_SUBDIR + shard path
+# only, NOT from LAYOUTS_ROOT -- so scoring this rerun with the default
+# RESULTS_ROOT=results would collide with the original run's CSVs of the same
+# name, and compute_metrics.py treats an existing output CSV as a resume
+# checkpoint (skips already-present (exp_idx, method) rows), which would
+# silently keep the OLD stress/timing numbers instead of recomputing them.
+NEW_RESULTS_ROOT="${NEW_RESULTS_ROOT:-results_converged}"
 SBM_CACHE_ROOT="${SBM_CACHE_ROOT:-data/sbm_cache}"
 GRG_CACHE_ROOT="${GRG_CACHE_ROOT:-data/grg_cache}"
 SUITESPARSE_CACHE_DIR="${SUITESPARSE_CACHE_DIR:-data/suitesparse_cache}"
@@ -94,7 +105,7 @@ if [ -n "$last_sbm_job" ]; then
     n_total=$(count_shards "${NEW_LAYOUTS_ROOT}/sbm_normalized")
     metrics_job=$(sbatch --parsable --dependency=afterok:"$last_sbm_job" --array=0-$((n_total - 1)) \
         --time="$METRICS_TIME" --mem="$METRICS_MEM" \
-        --export=ALL,FAMILY=sbm,FAMILY_SUBDIR=sbm_normalized,LAYOUTS_ROOT="$NEW_LAYOUTS_ROOT" \
+        --export=ALL,FAMILY=sbm,FAMILY_SUBDIR=sbm_normalized,LAYOUTS_ROOT="$NEW_LAYOUTS_ROOT",RESULTS_ROOT="$NEW_RESULTS_ROOT" \
         verification_experiments/slurm/run_metrics_array.sbatch)
     echo "  submitted metrics job $metrics_job (after $last_sbm_job, $n_total shards)"
 fi
@@ -120,7 +131,7 @@ if [ -n "$last_grg_job" ]; then
     n_total=$(count_shards "${NEW_LAYOUTS_ROOT}/grg_normalized")
     metrics_job=$(sbatch --parsable --dependency=afterok:"$last_grg_job" --array=0-$((n_total - 1)) \
         --time="$METRICS_TIME" --mem="$METRICS_MEM" \
-        --export=ALL,FAMILY=grg,FAMILY_SUBDIR=grg_normalized,LAYOUTS_ROOT="$NEW_LAYOUTS_ROOT" \
+        --export=ALL,FAMILY=grg,FAMILY_SUBDIR=grg_normalized,LAYOUTS_ROOT="$NEW_LAYOUTS_ROOT",RESULTS_ROOT="$NEW_RESULTS_ROOT" \
         verification_experiments/slurm/run_metrics_array.sbatch)
     echo "  submitted metrics job $metrics_job (after $last_grg_job, $n_total shards)"
 fi
@@ -138,7 +149,7 @@ if copy_and_strip "$src" "$dst"; then
     echo "  submitted embed job $embed_job ($n_shards shards)"
     metrics_job=$(sbatch --parsable --dependency=afterok:"$embed_job" --array=0-$((n_shards - 1)) \
         --time="$METRICS_TIME" --mem="$METRICS_MEM" \
-        --export=ALL,FAMILY=suitesparse,FAMILY_SUBDIR=suitesparse_normalized,LAYOUTS_ROOT="$NEW_LAYOUTS_ROOT" \
+        --export=ALL,FAMILY=suitesparse,FAMILY_SUBDIR=suitesparse_normalized,LAYOUTS_ROOT="$NEW_LAYOUTS_ROOT",RESULTS_ROOT="$NEW_RESULTS_ROOT" \
         verification_experiments/slurm/run_metrics_array.sbatch)
     echo "  submitted metrics job $metrics_job (after $embed_job, $n_shards shards)"
 fi
@@ -168,7 +179,9 @@ fi
 
 echo
 echo "Done. Track with: squeue -u \$USER"
-echo "Once all metrics jobs finish, merge as usual (see slurm/README.md step 3),"
-echo "globbing results/<family>_normalized_*_comparison.csv as before -- these"
-echo "still land in results/, unaffected by LAYOUTS_ROOT."
+echo "Metrics CSVs land under ${NEW_RESULTS_ROOT}/ (kept separate from results/"
+echo "so they can't collide with -- or get silently skipped against -- the"
+echo "original run's CSVs of the same shard names). Once all metrics jobs"
+echo "finish, merge with slurm/README.md step 3's pattern, pointed at"
+echo "${NEW_RESULTS_ROOT}/ instead of results/."
 echo "Drawings land under ${NEW_DRAWINGS_ROOT}/ once the draw job finishes."

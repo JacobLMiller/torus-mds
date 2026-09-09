@@ -27,10 +27,20 @@ FAMILY_SUBDIR="${FAMILY_SUBDIR:-$FAMILY}"
 # value here so this phase looks in the same place -- it defaults to "layouts"
 # to match run_embed_array.sbatch's own default.
 LAYOUTS_ROOT="${LAYOUTS_ROOT:-layouts}"
+# Output filenames below are derived from FAMILY_SUBDIR + shard path only --
+# NOT from LAYOUTS_ROOT -- so scoring two different LAYOUTS_ROOT trees (e.g.
+# "layouts" and "layouts_converged") with the default RESULTS_ROOT would
+# collide on the same output CSV. Worse than a clean overwrite: compute_metrics.py
+# treats an existing output CSV as a resume checkpoint (skips any (exp_idx,
+# method) pair already present), so a collision would silently keep stale
+# pre-rerun numbers under the new run's method names instead of recomputing
+# them. Set RESULTS_ROOT to a distinct directory whenever LAYOUTS_ROOT isn't
+# the default.
+RESULTS_ROOT="${RESULTS_ROOT:-results}"
 METRIC_SUBSAMPLE="${METRIC_SUBSAMPLE:-100}"
 NP_RADIUS="${NP_RADIUS:-2.0}"
 
-mkdir -p results
+mkdir -p "$RESULTS_ROOT"
 
 mapfile -t SHARD_DIRS < <(find "${LAYOUTS_ROOT}/${FAMILY_SUBDIR}" -mindepth 1 -name runs.csv -exec dirname {} \; | sort -V)
 
@@ -49,6 +59,6 @@ SHARD_NAME="$(echo "${FAMILY_SUBDIR}_${SHARD_DIR#${LAYOUTS_ROOT}/${FAMILY_SUBDIR
 
 python verification_experiments/compute_metrics.py \
   --layouts-dir "$SHARD_DIR" \
-  --output "results/${SHARD_NAME}_comparison.csv" \
+  --output "${RESULTS_ROOT}/${SHARD_NAME}_comparison.csv" \
   --metric-subsample "$METRIC_SUBSAMPLE" \
   --np-radius "$NP_RADIUS"

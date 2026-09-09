@@ -340,6 +340,127 @@ If you want the GRG/SBM chains to run one after another instead of side by
 side (12 cores lower peak, longer total time), give them the *same*
 `--job-name` instead of two different ones.
 
+## 1c. Parallelogram-mode run (separate experiment)
+
+`learn_mode='parallelogram'` TorusMDS (jointly learns scale *and* a fully
+general parallelogram shape -- side-length ratio and angle, unlike section
+1b's axis-aligned `alpha_aspect`) as a single opt-in method,
+`TorusMDS_parallelogram` (`modules/experiment_runner.py`), on SuiteSparse +
+SBM + GRG restricted to n <= 3000.
+
+**Isolated into its own `LAYOUTS_ROOT=layouts_parallelogram`** rather than
+added into the existing `layouts/{sbm,grg,suitesparse}_normalized/` trees:
+those trees' SBM/GRG tiers were built with a `GRAPHS_PER_SHARD` that turned
+out to vary per shard (checked directly: shard_0/1/2 of the same tier hold
+different graph counts), so there's no single value that's guaranteed to
+regenerate the exact same seeded graph set and safely append a new method's
+rows rather than silently drifting from what's already there. A fresh root
+sidesteps that entirely, at the cost of regenerating the (cheap, synthetic)
+SBM/GRG graphs once more.
+
+**SuiteSparse's `N_MIN`/`N_MAX` filter the already-staged manifest** by its
+`n` column (new -- previously suitesparse's embed phase always ran the whole
+staged pool). Unlike sbm/grg, where `N_MIN`/`N_MAX` pick a pre-partitioned
+generation tier, filtering the manifest reassigns which matrix each `exp_idx`
+maps to -- `run_embed_array.sbatch` folds them into `FAMILY_SUBDIR`
+automatically for `FAMILY=suitesparse` (`_n100to3000` etc.) so this can never
+silently collide with the unfiltered manifest's `shard_*/` dirs, even without
+`LAYOUTS_ROOT` below.
+
+**Metrics caveat**: `compute_metrics.py`'s `_geod_for` reconstructs the torus
+metric from `r0_fit`/`r1_fit` only (an axis-aligned rectangle) -- it does not
+yet account for a sheared parallelogram (`theta_fit` away from 90 degrees).
+`theta_fit` is persisted in `runs.csv` for every method now (NaN where not
+applicable) so it's available once that fix is made, but running section 2's
+metrics phase on `TorusMDS_parallelogram` rows today will silently score them
+against the wrong (unsheared) metric whenever the learned angle deviates from
+90 degrees -- treat those numbers as provisional until `_geod_for` is updated
+to use `parallelogram_distance(alpha, x, y)` for this method.
+
+**Smoke-test first** (per the convention above): timings for this method
+haven't been measured at scale -- it's the same per-iteration SGD kernel as
+plain `TorusMDS`/section 1b's variants (extra geometry update is O(1) per
+epoch), so it should be in the same ballpark as `TorusMDS` in the section 1
+timing note, but confirm with `--array=0-0`, `GRAPHS_PER_SHARD=2` (or a
+small `--n-max` for SuiteSparse) before the full submission, then check
+`t_embed` in the resulting shard's `runs.csv`.
+
+```bash
+cd ~/nobackup/torus-mds   # repo root
+mkdir -p slurm_logs
+
+export METHODS="TorusMDS_parallelogram"
+export LAYOUTS_ROOT="layouts_parallelogram"
+
+# --- SBM, 2 tiers (100-1000, 1000-3000) -- times are the section-1 SBM
+#     values for a 3-method run; padded headroom for one method's worth of
+#     actual cost until a real t_embed is measured ---
+sbatch --array=0-2 --time=00:20:00 --mem=2G \
+    --export=ALL,FAMILY=sbm,N_MIN=100,N_MAX=1000,GRAPHS_PER_SHARD=112 \
+    verification_experiments/slurm/run_embed_array.sbatch
+sbatch --array=0-2 --time=01:30:00 --mem=4G \
+    --export=ALL,FAMILY=sbm,N_MIN=1000,N_MAX=3000,GRAPHS_PER_SHARD=112 \
+    verification_experiments/slurm/run_embed_array.sbatch
+
+# --- GRG, same 2 tiers ---
+sbatch --array=0-2 --time=00:20:00 --mem=2G \
+    --export=ALL,FAMILY=grg,N_MIN=100,N_MAX=1000,GRAPHS_PER_SHARD=112 \
+    verification_experiments/slurm/run_embed_array.sbatch
+sbatch --array=0-2 --time=01:30:00 --mem=4G \
+    --export=ALL,FAMILY=grg,N_MIN=1000,N_MAX=3000,GRAPHS_PER_SHARD=112 \
+    verification_experiments/slurm/run_embed_array.sbatch
+
+# --- SuiteSparse, whole staged pool filtered to n <= 3000 (must already be
+#     staged per step 0, e.g. with --n-max 10000 or wider -- this only
+#     filters, it doesn't stage) ---
+sbatch --array=0-19 --time=00:30:00 --mem=4G \
+    --export=ALL,FAMILY=suitesparse,NUM_SHARDS=20,N_MIN=100,N_MAX=3000 \
+    verification_experiments/slurm/run_embed_array.sbatch
+```
+
+Then section 2's metrics phase, once the embed jobs above finish -- with
+**`RESULTS_ROOT` also set**: `run_metrics_array.sbatch`'s output filenames are
+derived from `FAMILY_SUBDIR` + shard path only, not `LAYOUTS_ROOT`, so with
+the default `RESULTS_ROOT=results` these would collide with (and, worse,
+resume-skip into) the existing baseline's `results/sbm_normalized_..._comparison.csv`
+etc. from the plain `layouts/` tree -- exactly the case the script's own
+`RESULTS_ROOT` comment warns about:
+
+```bash
+export LAYOUTS_ROOT="layouts_parallelogram"
+export RESULTS_ROOT="results_parallelogram"
+
+find layouts_parallelogram/sbm_normalized -mindepth 1 -name runs.csv | wc -l   # -> N
+sbatch --array=0-$((N-1)) --time=00:40:00 --mem=2G \
+    --export=ALL,FAMILY=sbm,FAMILY_SUBDIR=sbm_normalized \
+    verification_experiments/slurm/run_metrics_array.sbatch
+
+find layouts_parallelogram/grg_normalized -mindepth 1 -name runs.csv | wc -l   # -> N
+sbatch --array=0-$((N-1)) --time=00:40:00 --mem=2G \
+    --export=ALL,FAMILY=grg,FAMILY_SUBDIR=grg_normalized \
+    verification_experiments/slurm/run_metrics_array.sbatch
+
+find layouts_parallelogram/suitesparse_normalized_n100to3000 -mindepth 1 -name runs.csv | wc -l   # -> N
+sbatch --array=0-$((N-1)) --time=00:30:00 --mem=4G \
+    --export=ALL,FAMILY=suitesparse,FAMILY_SUBDIR=suitesparse_normalized_n100to3000 \
+    verification_experiments/slurm/run_metrics_array.sbatch
+```
+
+Then merge, reading from `results_parallelogram/` (same digit/`shard_`
+anchoring convention as section 3, to exclude any other `_normalized` variant
+sharing the same family/tier):
+
+```bash
+python verification_experiments/slurm/merge_results.py \
+    --glob "results_parallelogram/sbm_normalized_[0-9]*_comparison.csv" --output results_parallelogram/sbm_parallelogram_comparison.csv
+
+python verification_experiments/slurm/merge_results.py \
+    --glob "results_parallelogram/grg_normalized_[0-9]*_comparison.csv" --output results_parallelogram/grg_parallelogram_comparison.csv
+
+python verification_experiments/slurm/merge_results.py \
+    --glob "results_parallelogram/suitesparse_normalized_n100to3000_shard_*_comparison.csv" --output results_parallelogram/suitesparse_parallelogram_comparison.csv
+```
+
 ## 2. Submit metrics jobs (after the embed jobs finish)
 
 Count how many shard directories exist for a family, then submit an array

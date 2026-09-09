@@ -51,6 +51,12 @@ ASPECT_INIT_VARIANTS: dict[str, tuple[str, int, float]] = {
 
 DEFAULT_ASPECT_MAX_N: dict[str, int | None] = {name: None for name in ASPECT_INIT_VARIANTS}
 
+# learn_mode='parallelogram' TorusMDS: jointly learns scale and a fully
+# general parallelogram shape (side-length ratio + angle), instead of the
+# fixed unit-square torus of embed_torus_mds or the axis-aligned rectangle of
+# ASPECT_INIT_VARIANTS. Opt-in like ASPECT_INIT_VARIANTS/WRAP_VARIANTS.
+PARALLELOGRAM_METHOD = "TorusMDS_parallelogram"
+
 # The "smart" spectral init evaluated directly, with no SGD refinement --
 # isolates how good the initialization alone is. Shares the same per-graph
 # D/spectral_result cache as the "smart" ASPECT_INIT_VARIANTS (see the
@@ -151,6 +157,29 @@ def embed_torus_mds_aspect(
     )
     return (
         X, float(proj.alpha_), float(proj.r0_), float(proj.r1_),
+        proj.n_iter_, proj.termination_reason_,
+    )
+
+
+def embed_torus_mds_parallelogram(
+    D: np.ndarray,
+    max_iters: int = 2000,
+    seed: int = 42,
+    stress_mode: str = "raw",
+) -> tuple[np.ndarray, float, float, float, float, int | None, str | None]:
+    """
+    learn_mode='parallelogram' TorusMDS: jointly learns scale (alpha) and a
+    fully general parallelogram shape -- side-length ratio (r0_, r1_) and
+    angle (theta_) all free -- instead of the fixed unit-square torus of
+    embed_torus_mds or the axis-aligned rectangle of embed_torus_mds_aspect.
+    """
+    proj = MDSTorusProjector(projection="wrap")
+    X = proj.fit_transform(
+        D, max_iters=max_iters, seed=seed, stress_mode=stress_mode,
+        learn_mode=LearnMode.PARALLELOGRAM,
+    )
+    return (
+        X, float(proj.alpha_), float(proj.r0_), float(proj.r1_), float(proj.theta_),
         proj.n_iter_, proj.termination_reason_,
     )
 
@@ -287,7 +316,7 @@ def run_embeddings(
                         stacklevel=2,
                     )
                 records.append({**base_row, "t_embed": float("nan"), "alpha_fit": float("nan"),
-                                 "r0_fit": float("nan"), "r1_fit": float("nan"),
+                                 "r0_fit": float("nan"), "r1_fit": float("nan"), "theta_fit": float("nan"),
                                  "n_iter": float("nan"), "termination_reason": None,
                                  "status": "skipped_too_large"})
                 continue
@@ -296,6 +325,7 @@ def run_embeddings(
                 t0 = time.perf_counter()
                 n_iter = float("nan")
                 termination_reason = None
+                theta_fit = float("nan")
                 if method == "wrap_typescript" and n >= 600:
                     warnings.warn(
                         f"wrap_typescript on n={n} can take minutes and use multiple GiB of RSS.",
@@ -329,6 +359,12 @@ def run_embeddings(
                         spectral_result=spectral_result, max_iters=torus_max_iters,
                         seed=seed, stress_mode=torus_stress_mode,
                     )
+                elif method == PARALLELOGRAM_METHOD:
+                    if D is None:
+                        D, _ = apsp_distance_matrix(G)
+                    X, alpha_fit, r0_fit, r1_fit, theta_fit, n_iter, termination_reason = embed_torus_mds_parallelogram(
+                        D, max_iters=torus_max_iters, seed=seed, stress_mode=torus_stress_mode,
+                    )
                 elif method == SPECTRAL_INIT_ONLY_METHOD:
                     if D is None:
                         D, _ = apsp_distance_matrix(G)
@@ -356,13 +392,13 @@ def run_embeddings(
 
                 np.save(coords_path(output_dir, exp_idx, method), X)
                 records.append({**base_row, "t_embed": round(t_embed, 4), "alpha_fit": alpha_fit,
-                                 "r0_fit": r0_fit, "r1_fit": r1_fit, "n_iter": n_iter,
+                                 "r0_fit": r0_fit, "r1_fit": r1_fit, "theta_fit": theta_fit, "n_iter": n_iter,
                                  "termination_reason": termination_reason, "status": "ok"})
                 done.add((exp_idx, method))
             except Exception:
                 print(f"[{exp_idx}] {method} failed:\n{traceback.format_exc(limit=2)}")
                 records.append({**base_row, "t_embed": float("nan"), "alpha_fit": float("nan"),
-                                 "r0_fit": float("nan"), "r1_fit": float("nan"),
+                                 "r0_fit": float("nan"), "r1_fit": float("nan"), "theta_fit": float("nan"),
                                  "n_iter": float("nan"), "termination_reason": None,
                                  "status": "failed"})
 
