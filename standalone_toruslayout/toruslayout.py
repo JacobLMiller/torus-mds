@@ -53,7 +53,8 @@ def _windows_to_wsl_path(path: Path) -> str:
     path_str = resolved.as_posix()
     drive, rest = os.path.splitdrive(str(resolved))
     if drive:
-        return f"/mnt/{drive[0].lower()}{rest.replace('\\', '/')}"
+        rest_posix = rest.replace("\\", "/")
+        return f"/mnt/{drive[0].lower()}{rest_posix}"
     return path_str
 
 
