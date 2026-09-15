@@ -8,7 +8,26 @@
 *.gv
 *.npz
 *.csv
+*.pdf
+*.zip
+*.tex
+load_3figures_files_old/
 poster/
+.claude/
+
+# Generated experiment data/drawings (multi-GB, regenerate via
+# verification_experiments/ + verification_experiments/slurm/) -- explicit
+# directory rules so these can't be committed even if a future file inside
+# them doesn't match one of the extension patterns above.
+/layouts/
+/layout_drawings/
+/layout_drawings_grids/
+/layout_drawings_singles/
+/layout_drawings_singles_flat/
+/drawings/
+/figures/
+/results/
+/results_old/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

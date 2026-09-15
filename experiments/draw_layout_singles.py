@@ -41,7 +41,7 @@ from draw_layout_grids import find_shard_dirs, method_order, draw_panel
 
 
 def draw_graph_singles(shard_dir: str, exp_idx: int, group: pd.DataFrame, out_dir: str,
-                        dpi: int, overwrite: bool) -> tuple[int, int]:
+                        dpi: int, overwrite: bool, show_titles: bool = True) -> tuple[int, int]:
     """group: this exp_idx's status=='ok' rows. Returns (n_drawn, n_failed)."""
     G = load_graph(graph_path(shard_dir, exp_idx))
     rows = {row["method"]: row for _, row in group.iterrows()}
@@ -57,7 +57,7 @@ def draw_graph_singles(shard_dir: str, exp_idx: int, group: pd.DataFrame, out_di
         fig, ax = plt.subplots(figsize=(6, 6))
         try:
             X = np.load(coords_path(shard_dir, exp_idx, method))
-            draw_panel(ax, G, X, method, row, tsnet_style=True)
+            draw_panel(ax, G, X, method, row, tsnet_style=True, show_title=show_titles)
             fig.tight_layout()
             fig.savefig(outpath, dpi=dpi, bbox_inches="tight")
             n_ok += 1
@@ -70,7 +70,8 @@ def draw_graph_singles(shard_dir: str, exp_idx: int, group: pd.DataFrame, out_di
 
 
 def draw_shard(shard_dir: str, layouts_root: str, output_root: str,
-                max_graphs: int | None, dpi: int, overwrite: bool) -> tuple[int, int]:
+                max_graphs: int | None, dpi: int, overwrite: bool,
+                show_titles: bool = True, exp_idx_filter: set[int] | None = None) -> tuple[int, int]:
     runs_path = os.path.join(shard_dir, "runs.csv")
     try:
         runs = pd.read_csv(runs_path)
@@ -83,6 +84,8 @@ def draw_shard(shard_dir: str, layouts_root: str, output_root: str,
         return 0, 0
 
     exp_idxs = sorted(runs["exp_idx"].unique())
+    if exp_idx_filter is not None:
+        exp_idxs = [e for e in exp_idxs if e in exp_idx_filter]
     if max_graphs is not None:
         exp_idxs = exp_idxs[:max_graphs]
 
@@ -93,7 +96,8 @@ def draw_shard(shard_dir: str, layouts_root: str, output_root: str,
     for exp_idx in exp_idxs:
         group = runs[runs["exp_idx"] == exp_idx]
         out_dir = os.path.join(shard_out, f"exp_{exp_idx}")
-        ok, failed = draw_graph_singles(shard_dir, int(exp_idx), group, out_dir, dpi, overwrite)
+        ok, failed = draw_graph_singles(shard_dir, int(exp_idx), group, out_dir, dpi, overwrite,
+                                         show_titles=show_titles)
         n_ok += ok
         n_failed += failed
     return n_ok, n_failed
@@ -113,9 +117,16 @@ if __name__ == "__main__":
                              "(default: ../layout_drawings_singles/suitesparse_normalized)")
     parser.add_argument("--max-graphs-per-shard", type=int, default=None,
                         help="Cap on distinct exp_idx values drawn per shard (default: no cap)")
+    parser.add_argument("--exp-idx", type=int, nargs="+", default=None,
+                        help="Only draw these specific exp_idx values (default: all, subject "
+                             "to --max-graphs-per-shard). Applied before --max-graphs-per-shard.")
     parser.add_argument("--dpi", type=int, default=110, help="PNG resolution (default: 110)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Redraw PNGs that already exist (default: skip them)")
+    parser.add_argument("--titles", action=argparse.BooleanOptionalAction, default=True,
+                        help="Draw the '<method>, t=<t_embed>s' title on each PNG "
+                             "(default: on; pass --no-titles for bare images, e.g. for a "
+                             "figure whose captions are added externally)")
     args = parser.parse_args()
 
     shard_dirs = find_shard_dirs(args.layouts_root)
@@ -123,11 +134,14 @@ if __name__ == "__main__":
         print(f"No runs.csv found anywhere under {args.layouts_root}")
         sys.exit(1)
 
+    exp_idx_filter = set(args.exp_idx) if args.exp_idx else None
+
     total_ok, total_failed = 0, 0
     for i, shard_dir in enumerate(shard_dirs):
         n_ok, n_failed = draw_shard(
             shard_dir, args.layouts_root, args.output_root,
             args.max_graphs_per_shard, args.dpi, args.overwrite,
+            show_titles=args.titles, exp_idx_filter=exp_idx_filter,
         )
         total_ok += n_ok
         total_failed += n_failed

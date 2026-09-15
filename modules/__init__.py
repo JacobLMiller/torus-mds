@@ -1,3 +1,23 @@
+"""
+Core library for embedding graphs on a flat torus via minibatch SGD MDS.
+
+- `projector`: `MDSTorusProjector`, the main optimizer (learns point
+  positions and, depending on `learn_mode`, the torus's scale/aspect
+  ratio/shear -- see `LearnMode`).
+- `geometry`: closed-form flat-torus geodesic distances and gradients
+  (rectangular, rhombic, and general parallelogram fundamental domains).
+- `exact_torus_stress`: exact (non-SGD) stress evaluation/L-BFGS polishing,
+  used as the `finalize="lbfgs"` refinement step.
+- `metrics`: evaluation metrics (stress, distortion, neighborhood
+  preservation) used to score a layout against the input graph distances.
+- `visualization`: plotting a layout with torus-wrapped edges.
+- `graphio`: graph I/O helpers (shortest-path distances, periodic lattices,
+  the Chen et al. reference-graph format).
+- `experiment_runner`: the shared driver behind
+  `verification_experiments/{sbm,grg,suitesparse}_comparison.py` -- runs a
+  set of embedding methods over a stream of graphs and persists layouts.
+"""
+
 from .geometry import (
     torus_distance,
     rect_distance,
@@ -51,11 +71,4 @@ from .graphio import (
     get_periodic_lattice,
     parse_chen_json,
     load_chen_graphs,
-)
-from .comparison import (
-    GraphComparisonSpec,
-    LayoutComparisonResult,
-    compare_standalone_vs_mdstorus_graphs,
-    run_standalone_vs_mdstorus,
-    summarize_standalone_vs_mdstorus,
 )

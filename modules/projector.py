@@ -1,12 +1,3 @@
-"""
-TODO:
-Determine if graph is toroidal from the spectrum (eigenvalues come in pairs for first 4)
-Warm-up learning rate (start small, grow large, shrink again)
-Ensure that initialization is not destroyed...........
-Try three different sizes
-"""
-
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field

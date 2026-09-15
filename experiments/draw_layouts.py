@@ -16,9 +16,10 @@ scale/offset) -- it's min-max normalized to [0,1]^2 and drawn with straight
 (non-wrapped) edges via plot_embedding. Every other method (TorusMDS and all
 its aspect-init variants, wrap_python/wrap_typescript/wrap_python_newdist)
 already lives in [0,1)^2 and is drawn wrap-aware via
-plot_embedding_with_torus_edges, using alpha_fit/r0_fit/r1_fit from that
-row when present (NaN r0/r1 -- e.g. plain TorusMDS's fixed unit-square torus,
-or wrap_python which fits neither -- default to 1.0).
+plot_embedding_with_torus_edges, using alpha_fit/r0_fit/r1_fit/theta_fit from
+that row when present (NaN r0/r1/theta -- e.g. plain TorusMDS's fixed
+unit-square torus, or wrap_python which fits none of them -- default to 1.0
+for r0/r1 and pi/2 for theta, i.e. a rectangular unit-square torus).
 
 This can produce a LOT of files (shards x graphs x methods) -- use
 --methods/--max-graphs-per-shard to scope a run down before doing the full
@@ -68,12 +69,13 @@ def draw_one(G, X: np.ndarray, method: str, row: pd.Series, outpath: str, dpi: i
             alpha = row.get("alpha_fit")
             r0 = row.get("r0_fit")
             r1 = row.get("r1_fit")
+            theta = row.get("theta_fit")
             torus = SimpleNamespace(
                 torus_embedding_=None,
                 alpha_=float(alpha) if pd.notna(alpha) else 1.0,
                 r0_=float(r0) if pd.notna(r0) else 1.0,
                 r1_=float(r1) if pd.notna(r1) else 1.0,
-                theta_=np.pi / 2,
+                theta_=float(theta) if pd.notna(theta) else np.pi / 2,
             )
             plot_embedding_with_torus_edges(X=X, G=G, torus=torus, ax=ax)
         ax.set_title(f"exp_idx={row['exp_idx']} n={G.number_of_nodes()} method={method}", fontsize=9)

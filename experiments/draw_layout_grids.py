@@ -19,9 +19,10 @@ scale/offset) -- it's min-max normalized to [0,1]^2 and drawn with straight
 (non-wrapped) edges via plot_embedding. Every other method (TorusMDS and all
 its aspect-init variants, wrap_python/wrap_typescript/wrap_python_newdist)
 already lives in [0,1)^2 and is drawn wrap-aware via
-plot_embedding_with_torus_edges, using alpha_fit/r0_fit/r1_fit from that
-row when present (NaN r0/r1 -- e.g. plain TorusMDS's fixed unit-square torus,
-or wrap_python which fits neither -- default to 1.0).
+plot_embedding_with_torus_edges, using alpha_fit/r0_fit/r1_fit/theta_fit from
+that row when present (NaN r0/r1/theta -- e.g. plain TorusMDS's fixed
+unit-square torus, or wrap_python which fits none of them -- default to 1.0
+for r0/r1 and pi/2 for theta, i.e. a rectangular unit-square torus).
 
 Resumable: existing PNGs are skipped unless --overwrite is passed.
 
@@ -56,6 +57,7 @@ NON_PERIODIC_METHODS = {"s_gd2"}
 METHODS = [
     "s_gd2", "wrap_python",
     "TorusMDS_spectral_init", "TorusMDS_smart_1x_scale2", "TorusMDS_random_1x_scale2",
+    "TorusMDS_parallelogram",
 ]
 GRID_SHAPE = (2, 3)   # rows, cols -- up to 6 panels
 
@@ -72,7 +74,8 @@ def method_order(present: list[str]) -> list[str]:
     return ordered
 
 
-def draw_panel(ax, G, X: np.ndarray, method: str, row: pd.Series, tsnet_style: bool) -> None:
+def draw_panel(ax, G, X: np.ndarray, method: str, row: pd.Series, tsnet_style: bool,
+               show_title: bool = True) -> None:
     if method in NON_PERIODIC_METHODS:
         lo, hi = X.min(axis=0), X.max(axis=0)
         span = np.where(hi > lo, hi - lo, 1.0)
@@ -82,22 +85,24 @@ def draw_panel(ax, G, X: np.ndarray, method: str, row: pd.Series, tsnet_style: b
         alpha = row.get("alpha_fit")
         r0 = row.get("r0_fit")
         r1 = row.get("r1_fit")
+        theta = row.get("theta_fit")
         torus = SimpleNamespace(
             torus_embedding_=None,
             alpha_=float(alpha) if pd.notna(alpha) else 1.0,
             r0_=float(r0) if pd.notna(r0) else 1.0,
             r1_=float(r1) if pd.notna(r1) else 1.0,
-            theta_=np.pi / 2,
+            theta_=float(theta) if pd.notna(theta) else np.pi / 2,
         )
         plot_embedding_with_torus_edges(X=X, G=G, torus=torus, ax=ax,
                                          tsnet_style=tsnet_style, show_ticks=False)
-    t_embed = row.get("t_embed")
-    t_str = f", t={t_embed:.2g}s" if pd.notna(t_embed) else ""
-    ax.set_title(f"{method}{t_str}", fontsize=9)
+    if show_title:
+        t_embed = row.get("t_embed")
+        t_str = f", t={t_embed:.2g}s" if pd.notna(t_embed) else ""
+        ax.set_title(f"{method}{t_str}", fontsize=9)
 
 
 def draw_graph_grid(shard_dir: str, exp_idx: int, group: pd.DataFrame, outpath: str,
-                     dpi: int, tsnet_style: bool) -> int:
+                     dpi: int, tsnet_style: bool, show_titles: bool = True) -> int:
     """group: this exp_idx's status=='ok' rows. Returns the number of panels drawn."""
     G = load_graph(graph_path(shard_dir, exp_idx))
     rows = {row["method"]: row for _, row in group.iterrows()}
@@ -116,15 +121,16 @@ def draw_graph_grid(shard_dir: str, exp_idx: int, group: pd.DataFrame, outpath: 
         for ax, method in zip(axes, methods):
             row = rows[method]
             X = np.load(coords_path(shard_dir, exp_idx, method))
-            draw_panel(ax, G, X, method, row, tsnet_style)
+            draw_panel(ax, G, X, method, row, tsnet_style, show_title=show_titles)
             n_drawn += 1
         for ax in axes[len(methods):]:
             ax.axis("off")
 
-        sample_row = next(iter(rows.values()))
-        title = f"{sample_row.get('group', '')}/{sample_row.get('name', '')} " \
-                f"(n={G.number_of_nodes()}, exp_idx={exp_idx})"
-        fig.suptitle(title, fontsize=12)
+        if show_titles:
+            sample_row = next(iter(rows.values()))
+            title = f"{sample_row.get('group', '')}/{sample_row.get('name', '')} " \
+                    f"(n={G.number_of_nodes()}, exp_idx={exp_idx})"
+            fig.suptitle(title, fontsize=12)
         fig.tight_layout()
         fig.savefig(outpath, dpi=dpi, bbox_inches="tight")
     finally:
@@ -134,7 +140,7 @@ def draw_graph_grid(shard_dir: str, exp_idx: int, group: pd.DataFrame, outpath: 
 
 def draw_shard(shard_dir: str, layouts_root: str, output_root: str,
                 max_graphs: int | None, dpi: int, overwrite: bool,
-                tsnet_style: bool) -> tuple[int, int]:
+                tsnet_style: bool, show_titles: bool = True) -> tuple[int, int]:
     runs_path = os.path.join(shard_dir, "runs.csv")
     try:
         runs = pd.read_csv(runs_path)
@@ -161,7 +167,7 @@ def draw_shard(shard_dir: str, layouts_root: str, output_root: str,
             continue
         group = runs[runs["exp_idx"] == exp_idx]
         try:
-            draw_graph_grid(shard_dir, int(exp_idx), group, outpath, dpi, tsnet_style)
+            draw_graph_grid(shard_dir, int(exp_idx), group, outpath, dpi, tsnet_style, show_titles=show_titles)
             n_ok += 1
         except Exception as e:
             print(f"[{shard_dir}] exp_idx={exp_idx} failed: {e}")
@@ -188,6 +194,10 @@ if __name__ == "__main__":
     parser.add_argument("--tsnet-style", action=argparse.BooleanOptionalAction, default=True,
                         help="Draw tsNET-like: edges colored by length, small black vertices "
                              "(default: on; pass --no-tsnet-style for the plain style)")
+    parser.add_argument("--titles", action=argparse.BooleanOptionalAction, default=True,
+                        help="Draw per-panel method titles and the figure suptitle "
+                             "(default: on; pass --no-titles for bare panels, e.g. for a "
+                             "figure whose captions are added externally)")
     args = parser.parse_args()
 
     shard_dirs = find_shard_dirs(args.layouts_root)
@@ -200,6 +210,7 @@ if __name__ == "__main__":
         n_ok, n_failed = draw_shard(
             shard_dir, args.layouts_root, args.output_root,
             args.max_graphs_per_shard, args.dpi, args.overwrite, args.tsnet_style,
+            show_titles=args.titles,
         )
         total_ok += n_ok
         total_failed += n_failed
