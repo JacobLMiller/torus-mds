@@ -59,6 +59,9 @@ from .metrics import (
     SGS,
     geodesic_NP,
     estimate_alpha,
+    layout_edge_geometry,
+    edge_crossings,
+    incidence_angle,
 )
 from .visualization import (
     plot_embedding_with_torus_edges,
