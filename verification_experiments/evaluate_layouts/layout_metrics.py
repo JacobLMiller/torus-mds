@@ -83,6 +83,41 @@ def layout_query_distances(queries, X, *, periodic=True, alpha=1., r0=1., r1=1.,
 
 
 @numba.njit(cache=True)
+def _squared_distance_range(X, periodic, g00, g01, g11, transform):
+    """Smallest and largest squared pairwise distance, without an n-by-n matrix."""
+    lo, hi = np.inf, 0.
+    for i in range(len(X)):
+        for j in range(i):
+            a = X[j, 0] - X[i, 0]
+            b = X[j, 1] - X[i, 1]
+            if periodic:
+                a, b = (transform[0, 0]*a + transform[0, 1]*b,
+                        transform[1, 0]*a + transform[1, 1]*b)
+                a = _wrap_to_half(a)
+                b = _wrap_to_half(b)
+                a, b = _min_image_offset(a, b, g00, g01, g11)
+                squared = max(0., _gram_quad(a, b, g00, g01, g11))
+            else:
+                squared = a*a + b*b
+            lo = min(lo, squared)
+            hi = max(hi, squared)
+    return lo, hi
+
+
+def node_resolution(X, *, periodic=True, r0=1., r1=1., theta=np.pi/2):
+    """Ratio of the smallest to the largest pairwise node distance, over all nodes.
+
+    Uses the same layout metric as layout_distance_matrix; uniform scale
+    (alpha) cancels. 0 when two nodes coincide, NaN for fewer than two nodes or
+    if every node coincides. Larger is better.
+    """
+    _, g00, g01, g11, transform = _geometry_parameters(periodic, 1., r0, r1, theta)
+    lo, hi = _squared_distance_range(np.ascontiguousarray(X, dtype=np.float64), periodic,
+                                     g00, g01, g11, transform)
+    return float(np.sqrt(lo / hi)) if hi > 0 else float("nan")
+
+
+@numba.njit(cache=True)
 def fitted_distance_scale(distances, D):
     """Best multiplier sum(D*r)/sum(r^2), matching estimate_alpha's objective."""
     dr, rr = 0., 0.

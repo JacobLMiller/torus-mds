@@ -17,13 +17,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from verification_experiments.evaluate_layouts.layout_graph import load_layout_graph
 from verification_experiments.evaluate_layouts.layout_metrics import (
     layout_distance_matrix, distance_metrics, edge_metrics, silhouette_score, fitted_distance_scale,
-    graph_distance_ranks, sampled_query_metrics,
+    graph_distance_ranks, sampled_query_metrics, node_resolution,
 )
 from verification_experiments.evaluate_layouts.cluster_distance import cluster_distance, sbm_labels
 
 METRIC_COLUMNS = ["stress", "pointwise_stress", "distortion", "sgs", "np_score",
                   "edge_crossings", "incidence_angle", "cluster_distance",
-                  "mean_edge_length", "cluster_distance_normalized", "silhouette_score"]
+                  "mean_edge_length", "cluster_distance_normalized", "silhouette_score",
+                  "node_resolution"]
 
 
 def _parameter(row, name, default):
@@ -113,6 +114,7 @@ def score_layout(X, D, edges, method, row, np_radius=2., threads=1,
             "alpha_eval": alpha*evaluation_scale,
             "cluster_distance": separation, "mean_edge_length": mean_edge_length,
             "cluster_distance_normalized": normalized, "silhouette_score": silhouette,
+            "node_resolution": node_resolution(X, **geometry),
             "metric_sample_n": len(indices),
             "crossings_status": "exact" if exact_crossings else "skipped_vertex_limit"}
     if len(indices) < len(X):

@@ -85,6 +85,7 @@ sampling**, once per graph (BFS for unit weights, Dijkstra otherwise).
 | Silhouette                                | Sampled query nodes; all cluster members remain in distance means     |
 | Cluster distances                         | Full cluster hulls                                                    |
 | Incidence angle, mean edge length         | All nodes and edges                                                   |
+| Node resolution                           | All node pairs                                                        |
 | Crossings                                 | Exact if original vertex count is within the limit; otherwise skipped |
 
 Sampling can change fitted baseline scales and method rankings. Setting
@@ -108,6 +109,7 @@ graph distance, `r` the layout distance at `alpha_eval`, and `P` the pair count.
 | `mean_edge_length`            | Mean shortest edge length at saved scale                                   | No universal preference |
 | `cluster_distance_normalized` | `cluster_distance / mean_edge_length`                                      | Higher                  |
 | `silhouette_score`            | Mean SBM-label silhouette in layout distances                              | Higher                  |
+| `node_resolution`             | Smallest / largest pairwise node distance in the layout (below)            | Higher                  |
 
 **Neighbourhood preservation.** For each query, compare nodes at graph distance
 `0 < D <= np_radius` with equally many closest embedded nodes. Average their
@@ -128,6 +130,12 @@ error.
 Use physical tangent directions under the saved lattice shape. Degree 0 or 1
 contributes zero. Coincident linked endpoints make this undefined and the row
 `partial`.
+
+**Node resolution.** `min d(u,v) / max d(u,v)` over all unordered node pairs,
+with `d` the Euclidean distance for `s_gd2` and the torus distance under the
+saved lattice shape otherwise (same metric as stress). Uniform scale cancels,
+so `alpha` is irrelevant. Coincident nodes give 0; blank if all nodes coincide.
+Computed in O(n^2) time without materializing a distance matrix.
 
 **SBM labels.** A nonmissing `k` identifies planted consecutive blocks: the first
 `k-1` have `n//k` nodes; the last receives the remainder. Other graph families
