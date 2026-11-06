@@ -5,6 +5,9 @@
 #                the existing results/<family>_..._comparison.csv shards, so only
 #                (exp_idx, method) pairs not scored yet are computed; existing
 #                rows are carried over unchanged.
+#                Sample size: METRIC_SUBSAMPLE nodes per graph (default 1000, the
+#                same seed-42 sample the evaluator draws); compute_metrics.py
+#                refuses to resume a CSV scored with a different size.
 #   new metrics  evaluate_layouts_array.sbatch -> evaluate_layouts.py (crossings,
 #                incidence angle, node resolution, cluster metrics, ...) for every
 #                layout, into a separate NEW_RESULTS_ROOT.
@@ -22,6 +25,7 @@ set -euo pipefail
 LAYOUTS_ROOT="${LAYOUTS_ROOT:-layouts}"
 RESULTS_ROOT="${RESULTS_ROOT:-results}"
 NEW_RESULTS_ROOT="${NEW_RESULTS_ROOT:-results/layout_metrics}"
+METRIC_SUBSAMPLE="${METRIC_SUBSAMPLE:-1000}"
 MINIFORGE_ROOT="${MINIFORGE_ROOT:-$HOME/nobackup/miniforge3}"
 PYTHON_BIN="${PYTHON_BIN:-$MINIFORGE_ROOT/envs/torus-mds/bin/python}"
 SLURM_DIR=experiments/slurm
@@ -36,6 +40,8 @@ for f in experiments/compute_metrics.py $SLURM_DIR/run_metrics_array.sbatch \
          verification_experiments/evaluate_layouts/evaluate_layouts.py; do
   [ -f "$f" ] || fail "$f not found -- run from the repo root of an up-to-date checkout (git pull)"
 done
+grep -q "metric_subsample\": metric_subsample" experiments/compute_metrics.py \
+  || fail "compute_metrics.py does not record metric_subsample -- pull the latest code"
 grep -q "theta_fit" experiments/compute_metrics.py \
   || fail "compute_metrics.py predates the theta_fit fix; parallelogram layouts would be scored with the wrong metric"
 grep -q "python experiments/compute_metrics.py" $SLURM_DIR/run_metrics_array.sbatch \
@@ -68,10 +74,14 @@ fi
 # --- 5. back up existing results (small CSVs) ---
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP="${RESULTS_ROOT}_backup_${STAMP}"
-if [ -z "${DRY_RUN:-}" ]; then
+if [ -n "${DRY_RUN:-}" ]; then
+  :
+elif compgen -G "$RESULTS_ROOT/*.csv" > /dev/null; then
   mkdir -p "$BACKUP"
   cp -p "$RESULTS_ROOT"/*.csv "$BACKUP"/
   echo "Backed up $(ls "$BACKUP" | wc -l) CSVs from $RESULTS_ROOT/ to $BACKUP/"
+else
+  echo "$RESULTS_ROOT/ has no CSVs yet; nothing to back up (old metrics computed from scratch)."
 fi
 
 # --- 6. submit ---
@@ -79,11 +89,11 @@ mkdir -p slurm_logs
 JOBS=()
 for fam in "${FAMILIES[@]}"; do
   n=$(find "$LAYOUTS_ROOT/${fam}_normalized" -mindepth 1 -name runs.csv | wc -l)
-  id=$(run sbatch --parsable --job-name="metrics-old-$fam" --array=0-$((n - 1))%8 --time=01:00:00 --mem=4G \
-        --export=ALL,FAMILY=$fam,FAMILY_SUBDIR=${fam}_normalized,LAYOUTS_ROOT=$LAYOUTS_ROOT,RESULTS_ROOT=$RESULTS_ROOT \
+  id=$(run sbatch --parsable --job-name="metrics-old-$fam" --array=0-$((n - 1))%8 --time=08:00:00 --mem=4G \
+        --export=ALL,FAMILY=$fam,FAMILY_SUBDIR=${fam}_normalized,LAYOUTS_ROOT=$LAYOUTS_ROOT,RESULTS_ROOT=$RESULTS_ROOT,METRIC_SUBSAMPLE=$METRIC_SUBSAMPLE \
         $SLURM_DIR/run_metrics_array.sbatch)
   JOBS+=("$id")
-  echo "old metrics, $fam: $n shards -> job $id"
+  echo "old metrics, $fam: $n shards, $METRIC_SUBSAMPLE sampled nodes -> job $id"
 done
 id=$(run sbatch --parsable --job-name=metrics-new --partition=compute \
       --export=ALL,LAYOUTS_ROOT=$LAYOUTS_ROOT,RESULTS_ROOT=$NEW_RESULTS_ROOT,PYTHON_BIN=$PYTHON_BIN \

@@ -117,13 +117,21 @@ def run_metrics(
     records: list[dict] = []
     done: set[tuple[int, str]] = set()
     if os.path.exists(output_csv):
+        existing_df = None
         try:
             existing_df = pd.read_csv(output_csv)
+        except Exception:
+            pass
+        if existing_df is not None and len(existing_df):
+            # Rows without the column predate it; every run before then used 100.
+            previous = (set(existing_df["metric_subsample"].fillna(100).astype(int))
+                        if "metric_subsample" in existing_df else {100})
+            if previous != {metric_subsample}:
+                raise ValueError(f"{output_csv} was scored with metric_subsample={sorted(previous)}, not "
+                                 f"{metric_subsample}; use a fresh --output instead of mixing sample sizes")
             records = existing_df.to_dict("records")
             done = {(int(r["exp_idx"]), r["method"]) for r in records}
             print(f"Resuming: {len(done)} rows already scored.")
-        except Exception:
-            pass
 
     def checkpoint() -> None:
         pd.DataFrame(records).to_csv(output_csv, index=False)
@@ -160,7 +168,8 @@ def run_metrics(
                 X_s, D_s = _subsample(X, D, metric_subsample)
                 geod, alpha = _geod_for(method, X_s, D_s, r0=r0, r1=r1, theta=theta)
                 metrics = compute_metrics(X_s, D_s, geod, rg=np_radius)
-                records.append({**meta, "t_spd": round(t_spd, 4), **metrics, "alpha": round(alpha, 6) if np.isfinite(alpha) else alpha})
+                records.append({**meta, "t_spd": round(t_spd, 4), **metrics, "alpha": round(alpha, 6) if np.isfinite(alpha) else alpha,
+                                "metric_subsample": metric_subsample})
                 done.add((int(exp_idx), method))
             except Exception:
                 print(f"[{exp_idx}] {method} scoring failed:\n{traceback.format_exc(limit=2)}")

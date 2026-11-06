@@ -129,16 +129,26 @@ def check_tier(tier_dir: str, family: str, tier: str | None, results_root: str, 
         if os.path.exists(out):
             res = pd.read_csv(out)
             existing_rows += len(res)
-            stale = []
+            # Run fields compute_metrics.py copies from runs.csv: a mismatch means
+            # the layout was re-embedded after it was scored.
+            run_fields = [c for c in ("t_embed", "n_iter", "r0_fit", "r1_fit") if c in res.columns and c in df.columns]
+            stale, rerun = [], []
             for r in res.itertuples():
                 lay = layout_ok.get((int(r.exp_idx), r.method))
                 if lay is None or int(r.n) != int(lay.n) or any(
                         c in res.columns and not (pd.isna(getattr(r, c)) and pd.isna(getattr(lay, c)))
                         and getattr(r, c) != getattr(lay, c) for c in meta):
                     stale.append((int(r.exp_idx), r.method))
+                elif not all(np.isclose(getattr(r, c), getattr(lay, c), rtol=1e-6, atol=1e-4, equal_nan=True)
+                             for c in run_fields):
+                    rerun.append((int(r.exp_idx), r.method))
             if stale:
                 errors.append(f"{out}: {len(stale)} scored rows no longer match an ok layout, e.g. {stale[:5]} "
                               "-- resuming would keep these stale scores")
+            if rerun:
+                errors.append(f"{out}: {len(rerun)} scored rows were computed on an earlier embedding of the same "
+                              f"graph ({'/'.join(run_fields)} differ from runs.csv), e.g. {rerun[:3]} "
+                              "-- resuming would keep scores for layouts that no longer exist")
             if res.duplicated(["exp_idx", "method"]).any():
                 errors.append(f"{out}: duplicate (exp_idx, method) rows")
             n_para = int((res.method == "TorusMDS_parallelogram").sum())
