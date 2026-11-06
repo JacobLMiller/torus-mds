@@ -71,7 +71,16 @@ def check_tier(tier_dir: str, family: str, tier: str | None, results_root: str, 
         return
     cache = f"data/{family.split('_')[0]}_cache" + (f"/{tier}" if tier else "")
     manifest = os.path.join(cache, "manifest.csv")
-    expected = (set(pd.read_csv(manifest)["exp_idx"].astype(int)) if os.path.exists(manifest) else None)
+    expected, matrix_ids = None, None
+    if os.path.exists(manifest):
+        pool = pd.read_csv(manifest)
+        if "exp_idx" in pool:
+            expected = set(pool["exp_idx"].astype(int))
+        elif "matrix_id" in pool:
+            # suitesparse_comparison.py numbers the (unfiltered) staged pool by
+            # its position after sorting on matrix_id.
+            matrix_ids = pool.sort_values("matrix_id")["matrix_id"].astype(int).tolist()
+            expected = set(range(len(matrix_ids)))
 
     seen, to_score, existing_rows = set(), 0, 0
     per_method = {m: 0 for m in METHODS}
@@ -91,6 +100,12 @@ def check_tier(tier_dir: str, family: str, tier: str | None, results_root: str, 
             continue
         if (df.n != df.exp_idx.map(gn)).any():
             errors.append(f"{where}: {(df.n != df.exp_idx.map(gn)).sum()} rows whose n != graph file (run drop_mismatched_rows.py)")
+        if matrix_ids is not None and "matrix_id" in df:
+            wrong = df[[i >= len(matrix_ids) or matrix_ids[i] != m
+                        for i, m in zip(df.exp_idx.astype(int), df.matrix_id.astype(int))]]
+            if len(wrong):
+                errors.append(f"{where}: {len(wrong)} rows whose matrix_id doesn't match the staged pool's "
+                              f"exp_idx order, e.g. {wrong[['exp_idx', 'matrix_id']].head(3).values.tolist()}")
         meta = [c for c in df.columns if c not in RUN_COLUMNS]
         if meta and df.groupby("exp_idx")[meta].nunique(dropna=False).gt(1).any().any():
             errors.append(f"{where}: conflicting graph metadata within an exp_idx (run drop_mismatched_rows.py)")
