@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules.experiment_runner import coords_path, graph_path, load_graph
-from modules.geometry import euc_distance, torus_distance
+from modules.geometry import euc_distance, make_torus_geod
 from modules.graphio import apsp_distance_matrix
 from modules.metrics import (
     SGS,
@@ -70,7 +70,8 @@ def compute_metrics(X: np.ndarray, D: np.ndarray, geod, rg: float = 2.0) -> dict
     )
 
 
-def _geod_for(method: str, X: np.ndarray, D: np.ndarray, r0: float = 1.0, r1: float = 1.0):
+def _geod_for(method: str, X: np.ndarray, D: np.ndarray, r0: float = 1.0, r1: float = 1.0,
+              theta: float = np.pi / 2):
     # Re-estimate scale on the same (already subsampled) points used for the
     # metrics below, not the full graph -- estimate_alpha is an unvectorized
     # O(k^2) Python loop (like every other metric here), and at n=10,000
@@ -85,12 +86,16 @@ def _geod_for(method: str, X: np.ndarray, D: np.ndarray, r0: float = 1.0, r1: fl
     # variants learn a non-square aspect ratio, so their fitted r0_/r1_ must be
     # passed in -- positions are always wrapped to the unit square
     # (MDSTorusProjector._project_to_torus), but the *metric* on that square
-    # depends on the learned side lengths.
+    # depends on the learned side lengths. learn_mode='parallelogram' also
+    # learns the angle theta_ (radians), so theta must be passed too --
+    # make_torus_geod switches to the exact parallelogram distance whenever
+    # theta != pi/2 and is the plain rectangular distance otherwise.
     if method == "s_gd2":
         alpha = estimate_alpha(X, D, geod=euc_distance)
         return (lambda p, q, a=alpha: a * euc_distance(p, q)), alpha
-    alpha = estimate_alpha(X, D, r0=r0, r1=r1)
-    return (lambda p, q, a=alpha, r0=r0, r1=r1: a * torus_distance(p, q, r0=r0, r1=r1)), alpha
+    base = make_torus_geod(alpha=1.0, r0=r0, r1=r1, theta=theta)
+    alpha = estimate_alpha(X, D, geod=base)
+    return (lambda p, q, a=alpha: a * base(p, q)), alpha
 
 
 def run_metrics(
@@ -99,10 +104,13 @@ def run_metrics(
     metric_subsample: int = 100,
     np_radius: float = 2.0,
     checkpoint_every: int = 50,
+    methods: list[str] | None = None,
 ) -> pd.DataFrame:
     manifest_path = os.path.join(layouts_dir, "runs.csv")
     manifest = pd.read_csv(manifest_path)
     ok = manifest[manifest["status"] == "ok"].copy()
+    if methods:
+        ok = ok[ok["method"].isin(methods)]
 
     os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
 
@@ -145,10 +153,12 @@ def run_metrics(
                 r1 = row.get("r1_fit", 1.0)
                 r0 = 1.0 if pd.isna(r0) else float(r0)
                 r1 = 1.0 if pd.isna(r1) else float(r1)
+                theta = row.get("theta_fit", np.pi / 2)
+                theta = np.pi / 2 if pd.isna(theta) else float(theta)
 
                 X = np.load(coords_path(layouts_dir, int(exp_idx), method))
                 X_s, D_s = _subsample(X, D, metric_subsample)
-                geod, alpha = _geod_for(method, X_s, D_s, r0=r0, r1=r1)
+                geod, alpha = _geod_for(method, X_s, D_s, r0=r0, r1=r1, theta=theta)
                 metrics = compute_metrics(X_s, D_s, geod, rg=np_radius)
                 records.append({**meta, "t_spd": round(t_spd, 4), **metrics, "alpha": round(alpha, 6) if np.isfinite(alpha) else alpha})
                 done.add((int(exp_idx), method))
@@ -178,6 +188,8 @@ if __name__ == "__main__":
                         help="Graph-distance radius for neighbourhood preservation (default: 2.0)")
     parser.add_argument("--checkpoint-every", type=int, default=50,
                         help="Save CSV every N graphs (default: 50)")
+    parser.add_argument("--methods", type=str, nargs="+", default=None,
+                        help="Only score these methods (default: every method in runs.csv)")
     args = parser.parse_args()
 
     run_metrics(
@@ -186,4 +198,5 @@ if __name__ == "__main__":
         metric_subsample=args.metric_subsample,
         np_radius=args.np_radius,
         checkpoint_every=args.checkpoint_every,
+        methods=args.methods,
     )
