@@ -10,11 +10,16 @@ wrap_python on the freshly generated graph sharing that exp_idx and appended
 a row (and, when that graph had n <= 3500, an exp_<id>_wrap_python.npy) for
 the wrong graph. graph_<id>.npz itself was never overwritten, so it is the
 ground truth: any row whose n differs from it belongs to a foreign graph.
+n alone isn't enough -- the GRG generator reproduces the staged pool's node
+counts but not its graphs -- so the graph metadata columns (epsilon, k,
+graph_type, ...) must also match the exp_idx's first row in the manifest,
+which is always the original cache-mode run's (later runs only append).
 
 Per shard this
-  1. drops every row whose n != the node count of graphs/graph_<id>.npz,
-     moving the coords file of such an "ok" row into quarantine when the
-     file's row count also disagrees with the graph;
+  1. drops every row whose n != the node count of graphs/graph_<id>.npz or
+     whose metadata differs from that exp_idx's first row, moving the coords
+     file of such an "ok" row into quarantine when the file's row count also
+     disagrees with the graph;
   2. collapses exact repeats of "skipped_too_large" rows (one gets appended
      on every resume) down to the first copy.
 A shard is left untouched if the cleanup would leave any (exp_idx, method)
@@ -51,6 +56,20 @@ import pandas as pd
 import scipy.sparse as sp
 
 QUARANTINE = "_mismatch_quarantine"
+# Per-run columns written by run_embeddings; everything else describes the graph.
+RUN_COLUMNS = {"exp_idx", "n", "method", "seed", "t_embed", "alpha_fit", "r0_fit", "r1_fit",
+               "theta_fit", "n_iter", "termination_reason", "status"}
+
+
+def _meta_mismatch(df: pd.DataFrame) -> pd.Series:
+    meta = [c for c in df.columns if c not in RUN_COLUMNS]
+    if not meta:
+        return pd.Series(False, index=df.index)
+    first = df.groupby("exp_idx")[meta].transform("first")
+    # transform("first") skips NaN, so treat NaN as equal only when both sides are NaN.
+    a, b = df[meta], first
+    differs = ~((a == b) | (a.isna() & b.isna()))
+    return differs.any(axis=1)
 
 
 def _graph_sizes(shard_dir: str, exp_ids) -> dict[int, int | None]:
@@ -78,7 +97,7 @@ def clean_shard(shard_dir: str, apply: bool, stamp: str) -> tuple[int, int, bool
         return 0, 0, False
 
     graph_n = df["exp_idx"].astype(int).map(sizes)
-    mismatched = df["n"].astype(int) != graph_n
+    mismatched = (df["n"].astype(int) != graph_n) | _meta_mismatch(df)
     repeated_skip = (df["status"] == "skipped_too_large") & df.duplicated(keep="first") & ~mismatched
     keep = ~mismatched & ~repeated_skip
     kept = df[keep]

@@ -57,7 +57,7 @@ fi
 SHARD_DIR="${SHARD_DIRS[$SLURM_ARRAY_TASK_ID]}"
 SHARD_NAME="$(echo "${FAMILY_SUBDIR}_${SHARD_DIR#${LAYOUTS_ROOT}/${FAMILY_SUBDIR}/}" | tr '/' '_')"
 
-python verification_experiments/compute_metrics.py \
+python experiments/compute_metrics.py \
   --layouts-dir "$SHARD_DIR" \
   --output "${RESULTS_ROOT}/${SHARD_NAME}_comparison.csv" \
   --metric-subsample "$METRIC_SUBSAMPLE" \
